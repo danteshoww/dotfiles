@@ -1,0 +1,7 @@
+# Tacky-Borders (arquivos gerados em execução)
+.config/tacky-borders/*.sock
+.config/tacky-borders/*.log
+
+# Logs e backups automáticos
+*.log
+.config/komorebi-deck/backups/

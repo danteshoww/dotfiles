@@ -1,0 +1,6 @@
+
+[[mgr.prepend_keymap]]
+on = "T"
+run = 'shell --orphan "wt.exe -w 0 new-tab -d \"%h\""'
+desc = "Abrir nova aba na pasta selecionada"
+for = "windows"

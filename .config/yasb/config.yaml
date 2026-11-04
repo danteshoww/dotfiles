@@ -1,0 +1,478 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/amnweb/yasb/main/schema.json
+
+# For more information, visit https://github.com/amnweb/yasb/wiki
+watch_stylesheet: true
+watch_config: true
+system_colors: true
+debug: true
+update_check: true
+bars:
+  primary-bar:
+    enabled: true
+    screens: ["primary"]
+    class_name: yasb-bar
+    style: "adaptive"
+    alignment:
+      position: top
+      align: center
+    animation:
+      enabled: true
+      duration: 200
+    blur_effect:
+      enabled: false
+      dark_mode: false
+      round_corners: false
+      border_color: None
+    window_flags:
+      always_on_top: false
+      windows_app_bar: true
+      auto_hide: false
+    dimensions:
+      width: "100%"
+      height: 36
+    padding:
+      top: 0
+      left: 0
+      bottom: 0
+      right: 0
+    widgets:
+      left:
+      - komorebi_active_layout
+      - lines
+      - komorebi_workspaces
+      # - windows_workspaces
+      center:
+      - taskbar
+      right:
+      - audio_visualizer
+      - systray
+      - open_meteo
+      - github
+      - notifications
+      - volume
+      - theme_switcher
+      - clock
+      - control_center
+widgets:
+  taskbar:
+    type: "yasb.taskbar.TaskbarWidget"
+    options:
+      icon_size: 16
+      tooltip: true
+      show_only_visible: true
+      strict_filtering: true
+      monitor_exclusive: false
+      hide_empty: true
+      grouping:
+        enabled: true
+        show_count: false
+      animation:
+        enabled: true
+        duration: 200
+      preview:
+        enabled: true
+        width: 180
+        delay: 400
+        padding: 8
+        margin: 8
+        blur: true
+        peek: true
+      title_label:
+        enabled: false
+  audio_visualizer:
+    type: "yasb.audio_visualizer.AudioVisualizerWidget"
+    options:
+      edge_fade: 0
+      mirror: true
+      style: bars
+      height: 16
+      smoothness: 80
+      sensitivity: 50
+      auto_gain: true
+      framerate: 30
+      freq_min: 500
+      freq_max: 12000
+      hide_idle: true
+      hide_idle_after: 3000
+      channels: stereo
+      mono_option: average
+      reverse: false
+      bars:
+        count: 6
+        width: 1
+        gap: 4
+      waves:
+        width: 40
+      dots:
+        count: 16
+        size: 1
+        gap: 3
+  control_center:
+    type: "yasb.control_center.ControlCenterWidget"
+    options:
+      label: "<span>\uE712</span>"
+      tooltip: true
+      sections_order:
+        - "system_controls"
+        - "quick_actions"
+        - "sliders"
+        - "power"
+        - "media"
+      popup:
+        alignment: "right"
+        direction: "down"
+        border_color: System
+        round_corners: true
+        round_corners_type: normal
+        offset_top: 8
+      sections:
+        system_controls:
+          profile_image_size: 28
+          power_icon: "\uE7E8"
+          lock_icon: "\uE72E"
+          settings_icon: "\uE713"
+        quick_actions:
+          show: true
+          columns: 3
+          label_position: "default"
+          actions:
+            - id: "toggle_dnd"
+              label: "Do Not Disturb"
+              icon: "\uf285"
+            - id: "toggle_mute"
+              label: "Mute"
+              icon: "\ue74f"
+            - id: "toggle_mic_mute"
+              label: "Mic Mute"
+              icon: "\uF12E"
+            - id: "screenshot"
+              label: "Screenshot"
+              icon: "\ue91b"
+            - id: "touch_keyboard"
+              label: "Keyboard"
+              icon: "\uE765"
+            - id: "toggle_theme"
+              label: "Dark Mode"
+              icon: "\uE708"
+        sliders:
+          show: true
+          brightness:
+            show_slider: true
+            icon: "\uE706"
+            show_source_selector: true
+            source_selector_icon: "\uE972"
+          volume:
+            show_slider: true
+            icon: "\uE767"
+            show_source_selector: true
+            source_selector_icon: "\uE972"
+          microphone:
+            show_slider: true
+            icon: "\uE720"
+            show_source_selector: true
+            source_selector_icon: "\uE972"
+        media:
+          show: true
+          thumbnail_size: 36
+          thumbnail_radius: 4
+          icons:
+            prev_track: "\ue622"
+            next_track: "\ue623"
+            play: "\uf5b0"
+            pause: "\ue62e"
+        power:
+          show: true
+          power_plan_title: "Power Plan"
+          power_mode_title: "Power Mode"
+          button_menu_icon: "\ue76c"
+      callbacks:
+        on_left: "toggle_menu"
+  lines:
+    type: "yasb.custom.CustomWidget"
+    options:
+      label: "\u007c"
+      label_alt: "\u007c"
+      class_name: "separator-widget"
+      callbacks:
+        on_left: "do_nothing"
+  komorebi_workspaces:
+    type: "komorebi.workspaces.WorkspaceWidget"
+    options:
+      label_offline: "Komorebi Offline"
+      label_workspace_btn: "{index}"
+      label_workspace_active_btn: "{index}"
+      label_workspace_populated_btn: "{index}"
+      label_default_name: ""
+      label_zero_index: false
+      hide_empty_workspaces: true
+      hide_if_offline: true
+      toggle_workspace_layer:
+        enabled: false
+        tiling_label: "Tiling"
+        floating_label: "Floating"
+      app_icons:
+        enabled_populated: false
+        enabled_active: false
+        size: 12
+        max_icons: 0
+        hide_label: false
+        hide_duplicates: false
+        hide_floating: false
+  komorebi_active_layout:
+    type: "komorebi.active_layout.ActiveLayoutWidget"
+    options:
+      hide_if_offline: true
+      label: "{layout_name}"
+      layouts: ['bsp', 'columns', 'rows', 'grid', 'vertical_stack', 'horizontal_stack', 'ultrawide_vertical_stack', 'right_main_vertical_stack']
+      layout_icons:
+        bsp: "\uebeb"
+        columns: "\uebf7"
+        rows: "\uec01"
+        grid: "\udb81\udf58"
+        scrolling: "\uebf7"
+        vertical_stack: "\uebee"
+        horizontal_stack: "\uebf0"
+        ultrawide_vertical_stack: "\uebee"
+        right_main_vertical_stack: "\uebf1"
+        monocle: "\uf06f"
+        maximized: "\uf06f"
+        floating: "\uf2d2"
+        paused: "\udb83\udf89"
+        tiling: "\udb81\ude40"
+      callbacks:
+        on_left: "toggle_layout_menu"
+        on_middle: "next_layout"
+        on_right: "prev_layout"
+      layout_menu:
+        blur: true
+        round_corners: true
+        round_corners_type: "normal"
+        border_color: "System"
+        alignment: "left"
+        direction: "down"
+        offset_top: 8
+        offset_left: 0
+        show_layout_icons: true
+  theme_switcher:
+    type: "yasb.custom.CustomWidget"
+    options:
+      label: "{data}"
+      class_name: "theme-switcher-widget"
+      tooltip: true
+      tooltip_label: "Left: choose theme | Right: next theme"
+      exec_options:
+        run_cmd: "cmd /c pwsh -NoProfile -ExecutionPolicy Bypass -File %USERPROFILE%/.config/yasb/theme_switcher.ps1 get"
+        run_interval: 2000
+        return_format: "string"
+        hide_empty: false
+        use_shell: true
+      callbacks:
+        on_left: "exec cmd /c pwsh -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File %USERPROFILE%/.config/yasb/theme_switcher.ps1 menu"
+        on_right: "exec cmd /c pwsh -NoProfile -ExecutionPolicy Bypass -File %USERPROFILE%/.config/yasb/theme_switcher.ps1 next"
+        on_middle: "do_nothing"
+  windows_workspaces:
+    type: "yasb.windows_desktops.WorkspaceWidget"
+    options:
+      label_workspace_btn: ""
+      label_workspace_active_btn: ""
+      callbacks:
+        on_left: "activate_workspace"
+        on_middle: "do_nothing"
+        on_right: "toggle_context_menu"
+  clock:
+    type: yasb.clock.ClockWidget
+    options:
+      label: '{%H:%M}<span>{alarm}</span>'
+      label_alt: '{%a, %d %b %H:%M}'
+      timezones: []
+      calendar:
+        blur: true
+        round_corners: true
+        alignment: center
+        direction: down
+        extended: false
+        show_years: true
+        show_holidays: false
+        show_week_numbers: true
+      callbacks:
+        on_left: toggle_calendar
+        on_middle: toggle_label
+        on_right: context_menu
+  volume:
+    type: yasb.volume.VolumeWidget
+    options:
+      label: <span>{icon}</span>
+      label_alt: <span>{icon}</span>{level}
+      tooltip: true
+      icons:
+        muted: "\uE74F"
+        '5': "\uE995"
+        '10': "\uE995"
+        '20': "\uE995"
+        '50': "\uE995"
+        '100': "\uE995"
+      callbacks:
+        on_left: toggle_volume_menu
+        on_right: toggle_mute
+      audio_menu:
+        blur: true
+        round_corners: true
+        round_corners_type: normal
+        border_color: system
+        alignment: center
+        direction: down
+        show_apps: true
+        show_app_labels: false
+        show_app_icons: true
+        show_apps_expanded: false
+        app_icons:
+          toggle_down: "\uE972"
+          toggle_up: "\uE971"
+  notifications:
+    type: yasb.notifications.NotificationsWidget
+    options:
+      label: "<span>{icon}</span>"
+      label_alt: '{count} notifications'
+      hide_empty: false
+      tooltip: false
+      icons:
+        new: "\ued0c"
+        default: "\ue91c"
+      callbacks:
+        on_left: "toggle_notification"
+        on_right: clear_notifications
+        on_middle: do_nothing
+  quick_launch:
+    type: yasb.quick_launch.QuickLaunchWidget
+    options:
+      label: "<span>\uE71E</span>"
+      search_placeholder: Search applications...
+      max_results: 30
+      show_icons: true
+      icon_size: 16
+      compact_text: true
+      home_page: false
+      providers:
+        apps:
+          enabled: true
+          prefix: '*'
+          priority: 0
+          show_recent: true
+          max_recent: 5
+          show_description: true
+      popup:
+        width: 720
+        height: 480
+        blur: true
+        round_corners: true
+        round_corners_type: normal
+        border_color: System
+        dark_mode: true
+      callbacks:
+        on_left: toggle_quick_launch
+      keybindings:
+      - keys: alt+space
+        action: toggle_quick_launch
+        screen: active
+  systray:
+    type: "yasb.systray.SystrayWidget"
+    options:
+      class_name: "systray"
+      label_collapsed: "\uf107"
+      label_expanded: "\uf106"
+      label_position: "left"
+      icon_size: 16
+      pin_click_modifier: "alt"
+      show_unpinned: false
+      show_unpinned_button: true
+      show_battery: false
+      show_in_popup: 1
+      show_volume: false
+      show_network: true
+      use_hook: true
+      icons_per_row: 3
+      show_network: false
+      use_hook: false
+      hide_icons: []
+      popup:
+        blur: false
+        round_corners: true
+        round_corners_type: "normal"
+        border_color: None
+        alignment: "center"
+        direction: "down"
+        offset_top: 6
+        offset_left: 0
+  open_meteo:
+    type: yasb.open_meteo.OpenMeteoWidget
+    options:
+      label: "<span>\uE706</span>"
+      label_alt: "<span>\uE706</span> Current {temp}, Min {min_temp}, Max {max_temp}"
+      tooltip: true
+      update_interval: 600
+      hide_decimal: true
+      units: metric
+      callbacks:
+        on_left: toggle_card
+        on_middle: do_nothing
+        on_right: toggle_label
+      icons:
+        sunnyDay: "\uE706"
+        clearNight: "\uEC46"
+      weather_card:
+        blur: true
+        alignment: left
+        border_color: System
+        direction: down
+        icon_size: 32
+        show_hourly_forecast: true
+        time_format: 24h
+        hourly_point_spacing: 76
+        hourly_icon_size: 16
+        icon_smoothing: true
+        temp_line_width: 2
+        current_line_color: '#8EAEE8'
+        current_line_width: 1
+        current_line_style: dot
+        hourly_forecast_buttons:
+          enabled: false
+        weather_animation:
+          enabled: true
+          snow_overrides_rain: true
+          temp_line_animation_style: both
+          rain_effect_intensity: 1.0
+          snow_effect_intensity: 1.0
+          scale_with_chance: true
+  github:
+    type: yasb.github.GithubWidget
+    options:
+      label: "<span>\ueb00</span>"
+      label_alt: Notifications {data}
+      max_notification: 30
+      notification_dot:
+        enabled: true
+        corner: top_right
+        color: '#ef4747'
+        margin:
+        - 0
+        - 5
+      only_unread: false
+      show_comment_count: true
+      max_field_size: 54
+      update_interval: 600
+      icons:
+        comment: "\uE90A"
+      menu:
+        blur: true
+        round_corners: true
+        round_corners_type: normal
+        border_color: System
+        alignment: left
+        direction: down
+        show_categories: true
+        categories_order:
+        - Issue
+        - PullRequest
+        - CheckSuite
+        - Release
+        - Discussion

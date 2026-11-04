@@ -1,0 +1,77 @@
+.shell powershell
+
+# Recarregar configurações
+alt + o : taskkill /f /im whkd.exe; Start-Process whkd -WindowStyle hidden
+alt + shift + o : komorebic reload-configuration
+
+# Janela
+alt + q : komorebic close
+alt + m : komorebic minimize
+
+# Foco entre janelas
+alt + h : komorebic focus left
+alt + j : komorebic focus down
+alt + k : komorebic focus up
+alt + l : komorebic focus right
+alt + shift + oem_4 : komorebic cycle-focus previous # [
+alt + shift + oem_6 : komorebic cycle-focus next # ]
+
+# Mover janelas
+alt + shift + h : komorebic move left
+alt + shift + j : komorebic move down
+alt + shift + k : komorebic move up
+alt + shift + l : komorebic move right
+alt + shift + return : komorebic promote
+
+# Empilhar janelas
+alt + down : komorebic stack down
+alt + up : komorebic stack up
+alt + oem_1 : komorebic unstack # ;
+alt + oem_4 : komorebic cycle-stack previous # [
+alt + oem_6 : komorebic cycle-stack next # ]
+
+# Redimensionar
+alt + oem_plus : komorebic resize-axis horizontal increase
+alt + oem_minus : komorebic resize-axis horizontal decrease
+alt + shift + oem_plus : komorebic resize-axis vertical increase
+alt + shift + oem_minus : komorebic resize-axis vertical decrease
+
+# Manipular janelas
+alt + t : komorebic toggle-float
+alt + shift + f : komorebic toggle-monocle
+
+# Opções do gerenciador
+alt + shift + r : komorebic retile
+alt + p : komorebic toggle-pause
+
+# Layout
+alt + x : komorebic flip-layout horizontal
+alt + y : komorebic flip-layout vertical
+
+# Workspaces: ciclar (seus atalhos)
+alt + right : komorebic cycle-workspace next
+alt + left : komorebic cycle-workspace previous
+
+# Workspaces: enviar a janela para o workspace vizinho (seus atalhos)
+alt + shift + right : komorebic cycle-move-to-workspace next
+alt + shift + left : komorebic cycle-move-to-workspace previous
+
+# Workspaces: ir direto por número
+alt + 1 : komorebic focus-workspace 0
+alt + 2 : komorebic focus-workspace 1
+alt + 3 : komorebic focus-workspace 2
+alt + 4 : komorebic focus-workspace 3
+alt + 5 : komorebic focus-workspace 4
+alt + 6 : komorebic focus-workspace 5
+alt + 7 : komorebic focus-workspace 6
+alt + 8 : komorebic focus-workspace 7
+
+# Workspaces: mover a janela por número
+alt + shift + 1 : komorebic move-to-workspace 0
+alt + shift + 2 : komorebic move-to-workspace 1
+alt + shift + 3 : komorebic move-to-workspace 2
+alt + shift + 4 : komorebic move-to-workspace 3
+alt + shift + 5 : komorebic move-to-workspace 4
+alt + shift + 6 : komorebic move-to-workspace 5
+alt + shift + 7 : komorebic move-to-workspace 6
+alt + shift + 8 : komorebic move-to-workspace 7

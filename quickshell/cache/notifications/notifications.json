@@ -1,0 +1,13 @@
+[
+  {
+    "notificationId": 1,
+    "actions": [],
+    "appIcon": "",
+    "appName": "Shell",
+    "body": "Aproveite! Você pode reabrir o app de boas-vindas a qualquer momento com <tt>Super+Shift+Alt+/</tt>. Para abrir as configurações, aperte <tt>Super+I</tt>",
+    "image": "",
+    "summary": "App de Boas-vindas",
+    "time": 1791617194424,
+    "urgency": "1"
+  }
+]

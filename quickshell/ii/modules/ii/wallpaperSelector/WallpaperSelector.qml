@@ -1,0 +1,127 @@
+import qs
+import qs.services
+import qs.modules.common
+import qs.modules.common.widgets
+import qs.modules.common.functions
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+import Quickshell.Hyprland
+
+Scope {
+    id: root
+
+    Loader {
+        id: wallpaperSelectorLoader
+        property bool kept: false
+        active: GlobalStates.wallpaperSelectorOpen || (Platform.isWindows && wallpaperSelectorLoader.kept)
+        onLoaded: wallpaperSelectorLoader.kept = true
+
+        Connections {
+            target: GlobalStates
+            function onWallpaperSelectorOpenChanged() {
+                if (GlobalStates.wallpaperSelectorOpen)
+                    releaseTimer.stop();
+                else if (Platform.isWindows && wallpaperSelectorLoader.kept)
+                    releaseTimer.restart();
+            }
+        }
+
+        Timer {
+            id: releaseTimer
+            interval: 120000
+            onTriggered: wallpaperSelectorLoader.kept = false
+        }
+
+        sourceComponent: PanelWindow {
+            id: panelWindow
+            visible: GlobalStates.wallpaperSelectorOpen
+            readonly property HyprlandMonitor monitor: Hyprland.monitorFor(panelWindow.screen)
+            property bool monitorIsFocused: (Hyprland.focusedMonitor?.id == monitor?.id)
+
+            exclusionMode: ExclusionMode.Ignore
+            WlrLayershell.namespace: "quickshell:wallpaperSelector"
+            WlrLayershell.layer: WlrLayer.Overlay
+            WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
+            color: "transparent"
+
+            anchors.top: true
+            margins {
+                top: Config?.options.bar.vertical ? Appearance.sizes.hyprlandGapsOut : Appearance.sizes.barHeight + Appearance.sizes.hyprlandGapsOut
+            }
+
+            mask: Region {
+                item: content
+            }
+
+            implicitHeight: Math.min(Appearance.sizes.wallpaperSelectorHeight, (panelWindow.screen?.height ?? Appearance.sizes.wallpaperSelectorHeight) - panelWindow.margins.top - Appearance.sizes.hyprlandGapsOut)
+            implicitWidth: Math.min(Appearance.sizes.wallpaperSelectorWidth, (panelWindow.screen?.width ?? Appearance.sizes.wallpaperSelectorWidth) - 2 * Appearance.sizes.hyprlandGapsOut)
+
+            Component.onCompleted: {
+                if (panelWindow.visible)
+                    GlobalFocusGrab.addDismissable(panelWindow);
+            }
+            Component.onDestruction: {
+                GlobalFocusGrab.removeDismissable(panelWindow);
+            }
+            onVisibleChanged: {
+                if (panelWindow.visible)
+                    GlobalFocusGrab.addDismissable(panelWindow);
+                else
+                    GlobalFocusGrab.removeDismissable(panelWindow);
+            }
+            Connections {
+                target: GlobalFocusGrab
+                function onDismissed() {
+                    GlobalStates.wallpaperSelectorOpen = false;
+                }
+            }
+
+            WallpaperSelectorContent {
+                id: content
+                shown: GlobalStates.wallpaperSelectorOpen
+                anchors {
+                    fill: parent
+                }
+            }
+        }
+    }
+
+    function toggleWallpaperSelector() {
+        if (Config.options.wallpaperSelector.useSystemFileDialog) {
+            Wallpapers.openFallbackPicker(Appearance.m3colors.darkmode);
+            return;
+        }
+        GlobalStates.wallpaperSelectorOpen = !GlobalStates.wallpaperSelectorOpen
+    }
+
+    IpcHandler {
+        target: "wallpaperSelector"
+
+        function toggle(): void {
+            root.toggleWallpaperSelector();
+        }
+
+        function random(): void {
+            Wallpapers.randomFromCurrentFolder();
+        }
+    }
+
+    GlobalShortcut {
+        name: "wallpaperSelectorToggle"
+        description: "Toggle wallpaper selector"
+        onPressed: {
+            root.toggleWallpaperSelector();
+        }
+    }
+
+    GlobalShortcut {
+        name: "wallpaperSelectorRandom"
+        description: "Select random wallpaper in current folder"
+        onPressed: {
+            Wallpapers.randomFromCurrentFolder();
+        }
+    }
+}

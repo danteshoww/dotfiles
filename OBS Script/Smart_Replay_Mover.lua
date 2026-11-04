@@ -1,0 +1,7163 @@
+-- Smart Replay Mover v2.20.0
+-- Simple, safe, and reliable replay buffer organizer for OBS
+-- ============================================================================
+local VERSION = "2.20.0"
+local GITHUB_RAW_URL = "https://raw.githubusercontent.com/SlonickLab/Smart-Replay-Mover/main/Smart%20Replay%20Mover.lua"
+local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/releases"
+--
+-- Copyright (C) 2025-2026 SlonickLab
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU General Public License as published by
+-- the Free Software Foundation, either version 3 of the License, or
+-- (at your option) any later version.
+--
+-- This program is distributed in the hope that it will be useful,
+-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-- GNU General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License
+-- along with this program. If not, see <https://www.gnu.org/licenses/>.
+--
+-- Source Code: https://github.com/SlonickLab/Smart-Replay-Mover
+--
+-- NOTICE: This script is protected under GPL v3. Any distribution,
+-- modification, or derivative work MUST:
+--   1. Include this copyright notice and license
+--   2. Disclose the source code
+--   3. Use the same GPL v3 license
+--   4. Document all changes made
+--
+-- Plagiarism or removal of this notice violates the license terms.
+--
+-- ============================================================================
+-- CHANGELOG v2.20.0:
+--   - NEW: "Smart Add Chapter Marker" hotkey. It places a chapter marker and shows a
+--         notification, including why a marker was not added: not recording, paused, a
+--         recording format without chapter support, or OBS older than 30.2. OBS gives
+--         scripts no event for its own chapter hotkey, so this one is used instead
+--         (Issue #38, thanks @Besdroxk)
+--   - NEW: The update check works on Linux through curl or wget, and the download button
+--         opens the releases page with xdg-open. Linux users were never told about new
+--         versions before (Issue #37, thanks @TheFloatingCloud40)
+--   - FIX: A clip could overwrite an existing one when its path was close to the 260
+--         character limit and the name was already taken. That case now leaves the file in
+--         place, and truncation keeps room for the " (2)" suffix wherever the folder depth
+--         allows it
+--   - FIX: A failed move was always reported as a success. os_rename returns 0 on success
+--         and -1 on failure, and Lua treats both as true, so a replay could stay in the OBS
+--         folder under a "Clip Saved" notification and the move queue never retried it. A
+--         retried file now skips FFmpeg after its first failed attempt, since each run blocks
+--         OBS, and its error is logged once. Screenshots and recordings that could not be
+--         moved now say "Screenshot Not Moved" / "Recording Not Moved" instead of "Saved"
+--   - The Linux update check keeps its temporary file in the per-user runtime folder rather
+--         than under a fixed name in the /tmp shared by every user
+--   - FIX: KDE Plasma on Wayland without DISPLAY no longer turns the cursor into a window
+--         picker and freezes OBS on every save. The KWin call it used was the interactive
+--         "click a window" query, not the active window
+--   - FIX: FFmpeg thumbnails for games with "%" in the name, such as "100% Orange Juice",
+--         no longer leave a stray file and a duplicate on Windows
+--   - FIX: With FFmpeg thumbnails on Windows, a clip whose path has non-ASCII characters (a
+--         Cyrillic user folder, for example) no longer leaves its original and a .thumb.jpg
+--         behind in the OBS folder. Lua's os.remove reads paths in the system code page, not
+--         UTF-8, so these deletes now go through the Windows wide-character API
+--   - FIX: On Linux the screenshot detection cache measured CPU time instead of real time,
+--         so a screenshot taken after alt-tabbing could land in the previous game's folder
+--   - Removed the unused manual update-check code and the orphaned KWin helper
+
+-- CHANGELOG v2.16.0:
+--   - NEW: "Group split recordings into a session folder". When OBS splits a recording, the
+--         parts go into their own folder named after the session start time and are numbered
+--         "Part 01", "Part 02" instead of each carrying its own timestamp. Recordings that
+--         were never split are untouched, and the game prefix still follows the existing
+--         "Add game prefix" setting, so the game name survives templates without {game}
+--         (Issue #36, thanks @emoeckel)
+--   - CHANGE: The legacy "Monthly subfolders" flag is now folded into the folder
+--         template automatically on load, as "{game}/{yearmonth}". It previously waited
+--         for the Migrate button, so anyone who upgraded without opening the settings
+--         was still running on the old flag. The resulting paths are identical
+--   - Removed an unused split_files table left over from the pre-2.10.0 split handling
+
+-- CHANGELOG v2.15.0:
+--   - NEW: {type} folder template token, so Replays, Recordings and Screenshots can each
+--         get their own subfolder. "{game}/{type}" gives "Elden Ring/Replays". The token
+--         works anywhere in the template, so "{type}/{game}" and "{game}/{year}/{type}"
+--         are equally valid (Issue #35, thanks @NKrN2)
+
+-- CHANGELOG v2.14.0:
+--   - FIX: A failed FFmpeg run no longer costs you the recording. The script waited for
+--         FFmpeg but never read its exit code, so a half-finished file larger than 90% of
+--         the source counted as success and the original was deleted (PR #34, thanks
+--         @Txaverria)
+--   - FIX: Custom OBS audio track names are kept when a thumbnail is embedded into an MP4.
+--         The names are read with ffprobe before the remux, written back after, and the
+--         result is verified before the source is removed (PR #33, thanks @Txaverria)
+--   - CHANGE: Cover art embedding now runs for MP4 and MKV only. MOV, FLV, TS, AVI and WebM
+--         are moved without remuxing, since attached-picture streams do not survive there
+--   - MP4 thumbnails need ffprobe next to ffmpeg. Without it the clip is moved without a
+--         thumbnail instead of being remuxed blindly
+
+-- CHANGELOG v2.13.0:
+--   - FIX: Games run through Proton no longer land in a "steam_app_<AppID>" folder.
+--         When the process is a generic Steam AppID, the script now uses the window
+--         title (the real game name) instead (Issue #32, thanks @WatislavB)
+--   - NEW: Notification sound picker. Choose the sound from a dropdown, drop your own
+--         .wav files into a "sounds" folder next to the script, or pick "Random" to
+--         play a different one each time (Issue #31; random idea by @Jazun)
+--   - NEW: "Single notification" toggle. A replay save then shows only "Saving...",
+--         with no follow-up popups (Issue #31, thanks @Txaverria)
+--   - Notifications: a replay now beeps once (on "Saving...") and shows a single
+--         "Clip Saved" confirmation, instead of the sound and popup repeating
+
+-- CHANGELOG v2.12.0:
+--   - FIX: Clips now save correctly when the OBS output folder is a UNC network share
+--         (\\server\share). Creating a new game folder on a share used to fail because
+--         recursive_mkdir collapsed the leading "\\" into one "\", so Windows no longer
+--         recognized the network path. Existing folders were not affected
+--         (Issue #30, thanks @SmashinVP)
+
+-- CHANGELOG v2.11.0:
+--   - NEW: Filename prefix now matches the destination folder name (custom mappings
+--         and database names included) instead of the raw process name — e.g.
+--         "Aliens vs Predator - Replay.mp4" instead of "avp - Replay.mp4"
+--   - NEW: "Scan all running processes" now also matches custom name mappings and
+--         alias names, not just the built-in database (Issue #28)
+--   - NEW: Arena Breakout Infinite (UAGame.exe) and Chivalry 2 added to the database;
+--         Arena Breakout launcher added to the ignore list
+--   - Log wording: "Using cached game:" -> "Game folder:" (replay detection is fresh
+--         on every save; the old text wrongly suggested a stale cache)
+--   - NEW: Folder templates. The destination folder is now a template of {tokens}
+--         instead of a fixed <game> layout: {game} {year} {month} {day} {date}
+--         {yearmonth} {hour} {min}. Default "{game}" keeps prior behavior; each
+--         segment is sanitized so a template can never escape the OBS output folder
+--   - CHANGE: the "monthly subfolders" checkbox is replaced by the {yearmonth} token;
+--         users who had it enabled get a one-time "Migrate" button that folds it in
+
+-- CHANGELOG v2.10.0:
+--   - NEW: Replay Buffer Pro compatibility (github.com/JoshuaPotter/replay-buffer-pro).
+--         Replays now go through a deferred move queue: the script waits for RBP's
+--         background trim (the "X_trimmed" file) to finish, then organizes the final
+--         clip. New "REPLAY BUFFER PRO" settings group: Mode (Auto-Detect / Always On /
+--         Off) + optional "_trimmed" suffix removal (on by default)
+--   - NEW: Collision-safe naming - " (2)", " (3)" suffix instead of silently
+--         overwriting an existing file with the same name in the target folder
+--   - In RBP mode spam protection dedupes by file path, so rapid saves of different
+--         durations (15s/30s/60s hotkeys) are all kept; files are never auto-deleted
+--   - FIX: file_changed signal handler is now pcall-guarded (crash-safety)
+
+-- CHANGELOG v2.9.4:
+--   - FIX: Folders for non-Latin game names (Chinese/Japanese/Korean/Cyrillic) are now
+--         correct instead of garbled "mojibake" (Thanks @YxlaGyb, PR #24)
+--   - Migrated process & file-name reading to native Wide (UTF-16) Win32 APIs:
+--         GetModuleBaseNameW / QueryFullProcessImageNameW / FindFirstFileW (WIN32_FIND_DATAW).
+--         No system code page -> lossless for every language (replaces the ACP round-trip)
+--   - REFACTOR: Collapsed ~95 top-level locals into WIN / STATE / NOTIF tables to clear
+--         Lua's 200-local-per-chunk limit (199 -> 110); no behavior change, all pcall guards kept
+--   - Added utf8_truncate() so MAX_PATH trimming never splits a multi-byte UTF-8 character
+--
+-- CHANGELOG v2.9.3:
+--   - FIX: Split recordings now correctly organized into game folders (Issue #23)
+--   - FIX: Lua scoping bug where on_recording_file_changed() accessed a global
+--         instead of the local current_recording_file variable, causing stale paths
+--         from previous sessions to persist ("every other recording" bug)
+--   - FIX: Added fallback for initial recording file path via obs_output_get_settings()
+--         when get_last_file proc handler returns empty (common with adv_file_output)
+--   - FIX: Safety net in file_changed signal handler recovers previous file path
+--         from output settings when current_recording_file was never initialized
+--
+-- CHANGELOG v2.9.2:
+--   - FIX: Replay Buffer now reliably auto-restarts after saving large clips (>1GB)
+--   - FIX: Adaptive restart delay based on file size (scales from 2s to 20s)
+--         instead of a fixed delay which was too short for large files
+--   - FIX: Added verification + retry after buffer start (checks active state, retries 3x)
+--   - FIX: Added 5s safety timeout to force-restart buffer if STOPPED event never fires
+--   - FIX: Auto-restart logic moved outside file-path check (restarts even if path is nil)
+--   - Removed "avp" from game database (conflicts with Kaspersky avp.exe)
+--   - Added timer cleanup for new restart timers in script_unload
+--
+-- CHANGELOG v2.9.1:
+--   - FIX: Notification window now properly re-asserts TOPMOST on reuse (Win11 fix)
+--   - FIX: SetWindowPos called with HWND_TOPMOST after ShowWindow to force visibility
+--   - FIX: Removed SWP_NOZORDER flag that prevented Z-order update on window reuse
+--   - FIX: Update status now resets on every OBS launch (no more stale "Up to date" messages)
+--   - Added debug logging for exclusive fullscreen detection
+--
+-- CHANGELOG v2.9.0:
+--   - Linux Support: game detection via xprop (X11) and gdbus (KDE/Wayland)
+--   - Linux notifications via notify-send, sound via paplay/pw-play
+--   - OS Mode Selector (Auto-Detect / Windows / Linux) in Tools & Debug
+--   - Adaptive UI: Windows-only settings auto-hide on Linux
+--   - All FFI declarations consolidated into single guarded block
+--   - Every platform-specific path wrapped in pcall() for crash-proof stability
+--   - Linux OBS source scanning (xcomposite, pipewire, xshm)
+--   - Cross-platform helpers: join_path(), quote_shell_arg(), run_shell_command()
+--   - FFmpeg execution via shell commands on Linux (no .bat files)
+--   - Steam app identifier handling for Linux .desktop files
+--   - Quiet sound toggle (notification_sound_silent.wav) works on Linux via paplay/pw-play
+--   - Fixed FFmpeg thumbnails on Linux: proper shell quoting, path validation, error logging
+--   - Audit fixes: restored corrupted show_notification, removed stray end,
+--     added missing FFI declarations (FindWindowA, GetModuleHandleA,
+--     GetSystemMetrics, WinExec, WNDCLASSEXA, RegisterClassExA),
+--     added SEE_MASK_NOCLOSEPROCESS constant, fixed Lua pattern syntax,
+--     fixed nil crash in GITHUB_VERSION_FILE on Linux
+--
+-- CHANGELOG v2.8.2:
+--   - Added "Scan all running processes" fallback option (Thanks @EndCod3r)
+--   - Implemented zero-overhead Toolhelp32Snapshot API for safe process detection instead of OpenProcess
+--   - Fixed detection bug where alt-tabbing to Discord/OBS bypassed OBS Capture & Background game fallbacks
+--
+-- CHANGELOG v2.8.1 (HOTFIX):
+--   - CRITICAL FIX: Smart Save Hotkey no longer crashes/freezes OBS
+--   - Root cause: cross-thread Win32 GDI calls from hotkey/UI/graphics threads
+--   - Solution: thread-safe notification queue (notify() pushes to queue,
+--     single graphics-thread timer processes all Win32/GDI operations)
+--   - Fixed double detect_game() call in replay buffer save handler
+--   - Smart skip: if save is fast, "Saving..." is skipped in favor of "Clip Saved"
+--
+-- CHANGELOG v2.8.0:
+--   - Added "No Folder" mode: map process to "." to keep files in OBS output root
+--   - Added Smart Save Hotkey with instant "Saving..." notification feedback
+--   - Cleaned up duplicate ffi.cdef type declarations (code quality)
+--
+-- CHANGELOG v2.7.9:
+--   - Fixed is_ignored() false positives ("obs" no longer matches "observer")
+--   - Converted process ignore check to exact-match hash set (O(1) lookup)
+--   - Added Notification Position option (Top Right/Left, Bottom Right/Left)
+--   - Added "Auto-start Replay Buffer on OBS Launch" option
+--   - Fixed version string mismatches
+--
+-- CHANGELOG v2.7.8:
+--   - Added "Auto-restart Replay Buffer" option (prevents overlapping clips)
+--   - Implemented Event-Driven restart logic (safe & synchronous)
+--   - Added new "BUFFER CONTROL" settings section
+--
+-- CHANGELOG v2.7.7:
+--   - Added Notification Scaling (100-300%) for 4K/HiDPI monitors
+--   - Added "Test Notification" button to settings
+--   - Added "Use Quiet Sound" option (switches to notification_sound_silent.wav)
+--   - Improved Notification Window drawing with dynamic scaling
+--
+-- CHANGELOG v2.7.6:
+--   - Critical: Fixed detection for games with Anti-Cheat (ARC Raiders, THE FINALS)
+--   - Added fallback to QueryFullProcessImageNameA when OpenProcess is blocked
+--   - Improved robustness of process detection logic
+--
+-- CHANGELOG v2.7.4:
+--   - Critical: Fixed OBS freeze by implementing Notification Window Reuse
+--   - Optimized redraw throttling (CPU efficiency)
+--   - Added 0.5s safety delay for recording start initialization
+--   - Added screenshot detection cache & throttle for burst captures
+--   - Fixed GDI memory leak in window class background brush
+--   - Removed obsolete CALLBACK_ANCHOR cleanup logic
+--
+-- CHANGELOG v2.7.3 (Pull Request by zxsleebu):
+--   - Critical stability fix for Notification System (lua51.dll crash)
+--   - Replaced Lua WNDPROC with native DefWindowProcA
+--   - Manual render-on-timer logic implemented
+--   - Added window validation (IsWindow) checks
+--
+-- CHANGELOG v2.7.2:
+--   - Added FFmpeg Thumbnail support (embeds cover art into videos)
+--   - New "Advanced" settings tab for FFmpeg configuration
+--   - Safer file move operations with fallbacks
+--
+-- CHANGELOG v2.7.0:
+--   - Merged all files into single unified script
+--   - Embedded game database (1876 games) - no external file loading
+--   - Custom names have ABSOLUTE priority over all detection
+--   - Added ~40 new launcher entries to IGNORE_LIST
+--   - Removed dofile() dependency - more stable loading
+--   - Enhanced crash protection
+-- ============================================================================
+
+local obs = obslua
+local HAS_FFI, ffi = pcall(require, "ffi")
+if not HAS_FFI then ffi = nil end
+
+local PATH_SEP = package.config and package.config:sub(1, 1) or "/"
+local IS_WINDOWS_REAL = PATH_SEP == "\\"
+local TEMP_DIR = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"
+
+-- Global flags
+IS_WINDOWS = IS_WINDOWS_REAL
+WINDOWS_FFI_AVAILABLE = IS_WINDOWS and ffi ~= nil
+VISUAL_NOTIFICATIONS_SUPPORTED = WINDOWS_FFI_AVAILABLE
+
+local function get_env_first(...)
+    for i = 1, select("#", ...) do
+        local value = os.getenv(select(i, ...))
+        if value and value ~= "" then return value end
+    end
+    return nil
+end
+
+function join_path(dir, name)
+    if not dir or dir == "" then return name end
+    if dir:sub(-1) == "/" or dir:sub(-1) == "\\" then return dir .. name end
+    return dir .. PATH_SEP .. name
+end
+
+function quote_shell_arg(value)
+    return "'" .. tostring(value):gsub("'", "'\"'\"'") .. "'"
+end
+
+function run_shell_command(command)
+    local ok, ok_res, why, code = pcall(os.execute, command)
+    if not ok then return false end
+    if type(ok_res) == "number" then return ok_res == 0 end
+    if ok_res == true then
+        if why == "exit" then return code == 0 end
+        return true
+    end
+    return false
+end
+
+function command_exists(command_name)
+    return run_shell_command("command -v " .. quote_shell_arg(command_name) .. " >/dev/null 2>&1")
+end
+
+function capture_command_output(command)
+    local ok, pipe = pcall(io.popen, command .. " 2>/dev/null")
+    if not ok or not pipe then return nil end
+    local output = pipe:read("*a")
+    pcall(function() pipe:close() end)
+    if not output or output == "" then return nil end
+    return output
+end
+
+local SCRIPT_DIR = (function()
+    local info = debug.getinfo(1, "S")
+    if info and info.source then
+        local source = info.source
+        -- Remove @ prefix if present
+        if source:sub(1, 1) == "@" then
+            source = source:sub(2)
+        end
+        -- Extract directory path
+        return source:match("^(.*[/\\])") or ""
+    end
+    return ""
+end)()
+
+-- ============================================================================
+-- CONFIGURATION
+-- ============================================================================
+
+local CONFIG = {
+    os_mode = "auto",
+    add_game_prefix = true,
+    organize_screenshots = true,
+    organize_recordings = true,
+    group_split_recordings = false,
+    use_date_subfolders = false,  -- legacy; replaced by folder_template
+    folder_template = "{game}",
+    fallback_folder = "Desktop",
+    duplicate_cooldown = 5.0,
+    delete_spam_files = true,
+    debug_mode = false,
+    -- Notification settings
+    show_notifications = true,
+    play_sound = false,
+    notification_duration = 3.0,
+    single_notification = false,
+    notification_sound = "default",
+    -- FFmpeg settings
+    enable_thumbnails = false,
+    thumbnail_offset = 10.0,
+    ffmpeg_path = "",
+    -- Notification position
+    notification_position = "top_right",
+    -- Buffer Control
+    restart_buffer_after_save = false,
+    auto_start_buffer = false,
+    -- Process scan detection
+    scan_all_processes = false,
+    -- Replay Buffer Pro compatibility
+    rbp_mode = "auto",
+    strip_trimmed_suffix = true,
+}
+
+-- State tracking for buffer restart
+local restarting_buffer_active = false
+
+local GAME_DATABASE = {
+    ["000: dawn of war - dark crusade"] = "Warhammer 40",
+    ["000: dawn of war - game of the year edition"] = "Warhammer 40",
+    ["000: dawn of war - soulstorm"] = "Warhammer 40",
+    ["000: dawn of war iii"] = "Warhammer 40",
+    ["000: inquisitor - martyr"] = "Warhammer 40",
+    ["000: space marine"] = "Warhammer 40",
+    ["100orange"] = "100% Orange Juice",
+    ["140"] = "140",
+    ["1914-1918 series"] = "Verdun",
+    ["2000  to 1 a space felony"] = "2000:1: A Space Felony",
+    ["20xx"] = "20XX",
+    ["3dfxcarm"] = "Carmageddon",
+    ["60seconds"] = "60 Seconds!",
+    ["6kinoko"] = "New Super Marisa Land",
+    ["7daystodie"] = "7 Days to Die",
+    ["7daystodie_eac"] = "7 Days to Die",
+    ["8bitboy"] = "8BitBoy",
+    ["911"] = "911 Operator",
+    ["aagame"] = "America's Army: Proving Grounds",
+    ["aamfp"] = "Amnesia: A Machine for Pigs",
+    ["abewin"] = "Oddworld: Abe's Oddysee",
+    ["absolutedrift"] = "Absolute Drift",
+    ["absolver-win64-shipping"] = "Absolver",
+    ["ac3lhd_32"] = "Assassin's Creed Liberation HD",
+    ["ac3mp"] = "Assassin's Creed 3 Multiplayer",
+    ["ac3sp"] = "Assassin's Creed 3",
+    ["ac4bfmp"] = "Assassin's Creed IV: Black Flag",
+    ["ac4bfsp"] = "Assassin's Creed IV: Black Flag",
+    ["acbmp"] = "Assassin's Creed: Brotherhood",
+    ["acbsp"] = "Assassin's Creed: Brotherhood",
+    ["acc"] = "Assassin's Creed Rogue",
+    ["accgame-win32-shipping"] = "Assassin's Creed® Chronicles: India",
+    ["acclient"] = "Asheron's Call",
+    ["ace combat_ah"] = "Ace Combat Assault Horizon",
+    ["aces"] = "WarThunder",
+    ["acfc"] = "Assassin's Creed Freedom Cry",
+    ["acrmp"] = "Assassin's Creed Revelations Multiplayer",
+    ["acrsp"] = "Assassin's Creed Revelations",
+    ["acs"] = "Assassin's Creed Syndicate",
+    ["acu"] = "Assassin's Creed Unity",
+    ["adventure-capitalist"] = "AdVenture Capitalist",
+    ["adventure-communist"] = "AdVenture Communist",
+    ["advhd"] = "If My Heart Had Wings",
+    ["aer"] = "AER Memories of Old",
+    ["afterfx"] = "Adobe After Effects",
+    ["age"] = "Kamidori Alchemy Meister",
+    ["age2_x1"] = "Age of Empires II: The Conquerors",
+    ["age3y"] = "Age of Empires® III: Complete Collection",
+    ["ageofconan"] = "Age of Conan",
+    ["aim hero"] = "Aim Hero",
+    ["aimtastic"] = "Aimtastic",
+    ["aion.bin"] = "Aion",
+    ["airmech"] = "AirMech Strike",
+    ["aiwar"] = "AI War",
+    ["alan_wakes_american_nightmare"] = "Alan Wake's American Nightmare",
+    ["alanwake"] = "Alan Wake",
+    ["albion-online"] = "Albion Online",
+    ["alicemadnessreturns"] = "Alice: Madness Returns",
+    ["alienbreed-impact"] = "Alien Breed Impact",
+    ["alienbreed2assault"] = "Alien Breed 2: Assault",
+    ["alphaprime"] = "Alpha Prime",
+    ["altitude"] = "Alltitude",
+    ["amnesia"] = "Amnesia: The Dark Descent",
+    ["amorous.game.windows"] = "Amorous",
+    ["amtrucks"] = "American Truck Simulator",
+    ["anarchy"] = "Anarchy Online",
+    ["anb"] = "A New Beginning - Final Cut",
+    ["anna"] = "Anna's Quest",
+    ["anno2205"] = "Anno 2205",
+    ["anno5"] = "ANNO 2070",
+    ["anowor"] = "Another World",
+    ["anthemdemo"] = "Anthem",
+    ["antihero"] = "Antihero",
+    ["aok hd"] = "Age Of Empires 2",
+    ["aom_release_final"] = "Agents of Mayhem",
+    ["apb"] = "APB Reloaded",
+    ["apgame"] = "Alpha Protocol",
+    ["appdata"] = "Tropico 5",
+    ["application-steam-x64"] = "Banished",
+    ["aq3d"] = "AdventureQuest 3D",
+    ["aragami"] = "Aragami",
+    ["arcania"] = "ArcaniA",
+    ["archeage"] = "ArcheAge",
+    ["arena"] = "Total War Arena",
+    ["argo"] = "Argo",
+    ["argo_x64"] = "Argo",
+    ["arizonasunshine"] = "Arizona Sunshine",
+    ["arkhamvr"] = "Batman: Arkham VR",
+    ["arma2"] = "Arma 2",
+    ["arma2oa"] = "Arma 2: DayZ Mod",
+    ["arma2oa_be"] = "Arma 2: Operation Arrowhead",
+    ["arma3"] = "Arma 3",
+    ["armello"] = "Armello",
+    ["armikrog"] = "Armikrog",
+    ["armoredwarfare"] = "Armored Warfare",
+    ["arpiel"] = "Arpiel Online",
+    ["asamu-win32-shipping"] = "A Story About My Uncle",
+    ["asn_app_pcdx9_final"] = "Sonic & All-Stars Racing Transformed",
+    ["assassinscreed_dx10"] = "Assasin's Creed DX10",
+    ["assassinscreed_dx9"] = "Assasin's Creed DX9",
+    ["assassinscreed_game"] = "Assassin's Creed",
+    ["assassinscreediigame"] = "Assasin's Creed II",
+    ["assettocorsa"] = "Assetto Corsa",
+    ["astro-win64-shipping"] = "ASTRONEER",
+    ["astronautsgame-win64-shipping"] = "The Vanishing of Ethan Carter",
+    ["atilla"] = "Total War: Atilla",
+    ["atlasreactor"] = "Atlas Reactor",
+    ["attila"] = "Total War: Attila",
+    ["audiosurf"] = "Audiosurf",
+    ["audiosurf2"] = "Audiosurf 2",
+    ["autostarter"] = "Lost Horizon",
+    ["ava"] = "Alliance of Valiant Arms",
+    ["avalonlords"] = "Avalon Lords",
+    ["avgame-win64-shipping"] = "Vampyr",
+    ["avorion"] = "Avorion",
+    ["avp3"] = "Alien Vs Predator",
+    ["avp_dx11"] = "Aliens vs Predator",
+    ["awesomenauts"] = "Awesomenauts",
+    ["axiomverge"] = "Axiom Verge",
+    ["b1-win64-shipping"] = "Black Myth: Wukong",
+    ["backtobed"] = "Back to Bed",
+    ["badnorth"] = "Bad North",
+    ["baldur"] = "Baldur's Gate",
+    ["ball 3d"] = "Ball 3D: Soccer Online",
+    ["ballisticoverkill"] = "Ballistic Overkill",
+    ["bangbangracing"] = "Bang Bang Racing",
+    ["barkleyv120"] = "Charles Barkley: Shut Up and Jam Gaiden",
+    ["base"] = "The Ultimate DOOM",
+    ["bastion"] = "Bastion",
+    ["batalj beta"] = "BATALJ",
+    ["batim"] = "Bendy and the Ink Machine",
+    ["batmanac"] = "Batman: Arkham City",
+    ["batmanak"] = "Batman Arkham Knight",
+    ["batmanorigins"] = "Batman: Arkham Origins",
+    ["battleblocktheater"] = "BattleBlock Theater",
+    ["battlefront"] = "Star Wars Battlefront",
+    ["battlefrontii"] = "Star Wars Battlefront II",
+    ["battlerite"] = "Battlerite",
+    ["battleroyaletrainer-win64-shipping"] = "Battle Royale Trainer",
+    ["battles-win"] = "Bloons TD Battles",
+    ["battletech"] = "BATTLETECH",
+    ["battlevschess"] = "Battle vs Chess",
+    ["battleworldskronos"] = "Battle Worlds: Kronos",
+    ["bayonetta"] = "Bayonetta",
+    ["bbcse"] = "BlazBlue Continuum Shift Extend",
+    ["bbtag"] = "BlazBlue Cross Tag Battle",
+    ["bc"] = "Battle Chasers: Nightwar",
+    ["beamng.drive.x64"] = "BeamNG.drive",
+    ["beat saber"] = "Beat Saber",
+    ["beathazard"] = "Beat Hazard",
+    ["beathazardclassic"] = "Beat Hazard Classic",
+    ["beginnersguide"] = "The Beginner's Guide",
+    ["beholder"] = "Beholder",
+    ["bejblitz"] = "Bejeweled Blitz",
+    ["bejeweled3"] = "Bejeweled 3",
+    ["berimbau"] = "Blade Symphony",
+    ["besiege"] = "Besiege",
+    ["bf1"] = "Battlefield 1",
+    ["bf2"] = "Battlefield 2",
+    ["bf2042"] = "Battlefield 2042",
+    ["bf3"] = "Battlefield 3",
+    ["bf4"] = "Battlefield 4",
+    ["bf4cte"] = "Battlefiled 4 CTE",
+    ["bfbc2game"] = "Battlefield: Bad Company 2",
+    ["bfh"] = "Battlefield™ Hardline",
+    ["bfvob"] = "Battlefield 5",
+    ["bf6"] = "Battlefield 6",
+    ["bge"] = "Beyond Good and Evil",
+    ["bgi"] = "Go! Go! Nippon! ~My First Trip to Japan~",
+    ["bgt"] = "Bloody Good Time",
+    ["bh6"] = "Resident Evil 6",
+    ["bhd"] = "Resident Evil 4HD Remaster",
+    ["bia"] = "Brothers in Arms: Road to Hill 30",
+    ["binding_of_isaac"] = "The Binding of Isaac",
+    ["bio4"] = "resident evil 4 / biohazard 4",
+    ["bioshock"] = "Bioshock",
+    ["bioshock2"] = "BioShock II",
+    ["bioshock2hd"] = "BioShock 2 Remastered",
+    ["bioshockhd"] = "BioShock Remastered",
+    ["bioshockinfinite"] = "BioShock Infinite",
+    ["bit heroes"] = "Bit Heroes",
+    ["blackdesert32"] = "Black Desert Online",
+    ["blackdesert64"] = "Black Desert Online",
+    ["blackdesertpatcher32.pae"] = "Black Desert Online Turkiye and MENA",
+    ["blackguards"] = "Blackguards",
+    ["blackguards 2"] = "Blackguards 2",
+    ["blacklist_dx11_game"] = "Splinter Cell: Blacklist",
+    ["blacklist_game"] = "Splinter Cell: Blacklist",
+    ["blackmirror"] = "Black Mirror",
+    ["blackops3"] = "Call of Duty: Black Ops III",
+    ["blackopsmp"] = "Call of Duty: Black Ops",
+    ["blackshot"] = "Blackshot SEA",
+    ["blacksurvival"] = "Black Survival",
+    ["blackwake"] = "Blackwake",
+    ["blackxchg.aes"] = "Counter-Strike Nexon: Zombies",
+    ["bladekitten"] = "Blade Kitten",
+    ["blobby"] = "Blobby Volley 2",
+    ["blocknload"] = "Block N Load",
+    ["bloodandbacon"] = "Blood and Bacon",
+    ["bloodbowl2"] = "Blood Bowl 2",
+    ["bloodbowl2_dx_32"] = "Blood Bowl 2",
+    ["bloodbowl2_gl_32"] = "Blood Bowl 2",
+    ["bloodlinechampions"] = "Bloodline Champions",
+    ["bloody trapland"] = "Bloody Trapland",
+    ["blr"] = "Blacklight: Retribution",
+    ["bms"] = "Black Mesa",
+    ["boid"] = "Boid",
+    ["bombercrew"] = "Bomber Crew",
+    ["bombtag"] = "BombTag",
+    ["bootggxrd"] = "Guilty Gear Xrd -SIGN-",
+    ["borderlands"] = "Borderlands",
+    ["borderlands2"] = "Borderlands 2",
+    ["borderlandspresequel"] = "Borderlands: the Pre-Sequel",
+    ["boringmangame"] = "Boring Man - Online Tactical Stickman Combat",
+    ["bout2"] = "The Book of Unwritten Tales 2",
+    ["braid"] = "Braid",
+    ["brawlhalla"] = "Brawlhalla",
+    ["breach"] = "Into the Breach",
+    ["breach-win64-shipping"] = "Breach",
+    ["brickrigs-win64-shipping"] = "Brick Rigs",
+    ["bridge_constructor_medieval"] = "Bridge Constructor Medieval",
+    ["bridge_constructor_portal"] = "Bridge Constructor Portal",
+    ["bridgeconstructor"] = "Bridge Constructor",
+    ["bridgeconstructorplayground"] = "Bridge Constructor Playground",
+    ["broforce_beta"] = "Broforce",
+    ["brokeprotocol"] = "BROKE PROTOCOL: Online City RPG",
+    ["brothers"] = "Brothers - A Tale of Two Sons",
+    ["brutallegend"] = "Brutal Legend",
+    ["btd5-win"] = "Bloons TD5",
+    ["bugs"] = "BBLiT",
+    ["bully"] = "Bully: Scholarship Edition",
+    ["burnoutparadise"] = "Burnout Paradise",
+    ["businesstour"] = "Business Tour - Online Multiplayer Board Game",
+    ["cabal2main"] = "Cabal 2",
+    ["cabalmain"] = "Cabal Online",
+    ["cactus"] = "Assault Android Cactus",
+    ["caggameserver"] = "Grav",
+    ["call of war"] = "Call of War",
+    ["call_to_arms"] = "Call to Arms",
+    ["captainspirit-win64-shipping"] = "The Awesome Adventures of Captain Spirit",
+    ["cardhunter"] = "Card Hunter",
+    ["cargocommander"] = "Cargo Commander",
+    ["carma"] = "Carmageddon",
+    ["carmag"] = "Carmageddon",
+    ["carmageddon_max_damage"] = "Carmageddon: Max Damage",
+    ["carmageddon_reincarnation"] = "Carmageddon Reincarnation",
+    ["carmagv"] = "Carmageddon",
+    ["carmav"] = "Carmageddon",
+    ["carriedaway"] = "Carried Away",
+    ["carrier"] = "Carrier Command: Gaea Mission",
+    ["castle"] = "Castle Crashers",
+    ["castleminerz"] = "CastleMiner Z",
+    ["cataclysm-tiles"] = "Cataclysm: Dark Days Ahead",
+    ["cave"] = "The Cave",
+    ["cavestory+"] = "Cave Story+",
+    ["celebritypoker"] = "Poker Night at the Inventory",
+    ["celeste"] = "Celeste",
+    ["childoflight"] = "Child of Light",
+    ["chivalry2-win64-shipping"] = "Chivalry 2",
+    ["chronicle"] = "Chronicle - Runescape Legends",
+    ["cities"] = "Cities: Skylines",
+    ["citra-qt"] = "Citra",
+    ["civ3conquests"] = "Sid Meier's Civilization III: Complete",
+    ["civilizationbe_dx11"] = "Sid Meier's Civilization: Beyond Earth",
+    ["civilizationbe_mantle"] = "Sid Meier's Civilization: Beyond Earth",
+    ["civilizationv"] = "Sid Meier's Civilization V",
+    ["civilizationv_dx11"] = "Sid Meier's Civilization V",
+    ["civilizationv_tablet"] = "Sid Meier's Civilization V",
+    ["civilizationvi"] = "Sid Meier's Civilization VI",
+    ["ck2game"] = "Crusader Kings II",
+    ["ckan"] = "CKAN",
+    ["clicker heroes"] = "Clicker Heroes",
+    ["client_tos"] = "Tree of Savior",
+    ["clientpatcher"] = "Secret World Legends",
+    ["climb"] = "Climb",
+    ["clone drone in the danger zone"] = "Clone Drone in the Danger Zone",
+    ["clonk"] = "Clonk Rage",
+    ["cloudsandsheep2"] = "Clouds & Sheep 2",
+    ["clragexe"] = "Ragnarok Online Classic",
+    ["clustertruck"] = "Clustertruck",
+    ["cm black sea"] = "Combat Mission: Black Sea",
+    ["cm shock force"] = "Combat Mission: Shock Force",
+    ["cm3"] = "Crazy Machines 3",
+    ["cms2015"] = "Car Mechanic Simulator 2015",
+    ["cms2018"] = "Car Mechanic Simulator 2018",
+    ["cmw"] = "Chivalry: Medieval",
+    ["cod"] = "Call of Duty: Warzone",
+    ["cod2mp_s"] = "Call of Duty 2",
+    ["cod2sp_s"] = "Call of Duty 2",
+    ["codsp_s"] = "Call of Duty 2:",
+    ["codwaw"] = "Call of Duty: World at War",
+    ["codwawmp"] = "Call of Duty: World at War",
+    ["coflaunchapp"] = "Cry of Fear",
+    ["coj"] = "Call of Juarez",
+    ["cojbibgame_x86"] = "Call of Juarez: Bound in Blood",
+    ["cojgunslinger"] = "Call of Juarez: Gunslinger",
+    ["colonyclient"] = "Colony Survival",
+    ["comedy night"] = "Comedy Night",
+    ["command"] = "Command: Modern Air/Naval Operations",
+    ["conansandbox_be"] = "Conan Exiles",
+    ["consim2015"] = "Construction Simulator 2015",
+    ["consortium"] = "Consortium",
+    ["contagion"] = "Contagion",
+    ["conviction_game"] = "Tom Clancy's Splinter Cell Conviction",
+    ["cortex command"] = "Cortex Command",
+    ["cosmic"] = "Cosmic Break",
+    ["cosmicbreak2"] = "Cosmic Break 2",
+    ["cosmicleague"] = "Cosmic League",
+    ["cossacks"] = "Cossacks 3",
+    ["crawl"] = "Crawl",
+    ["creativerse"] = "Creativerse",
+    ["creeper world 2"] = "Creeper World 2: Redemption",
+    ["critterchronicles"] = "The Book of Unwritten Tales: The Critter Chronicles",
+    ["crookz"] = "Crookz - The Big Heist",
+    ["crossfire"] = "CrossFire",
+    ["crowfallclient"] = "Crowfall",
+    ["crusader2"] = "Stronghold Crusader 2",
+    ["crushcrush"] = "Crush Crush",
+    ["cryptark"] = "CRYPTARK",
+    ["crysis"] = "Crysis",
+    ["crysis2"] = "Crysis 2",
+    ["crysis3"] = "Crysis 3",
+    ["crysis64"] = "Crysis",
+    ["cs2d"] = "CS2D",
+    ["csdsteambuild"] = "Cook, Serve, Delicious!",
+    ["csgo"] = "Counter-Strike: Global Offensive",
+    ["cube"] = "Cube World",
+    ["cuphead"] = "Cuphead",
+    ["cure"] = "Codename CURE",
+    ["cw"] = "Closers Dimension Conflict",
+    ["cw3"] = "Creeper World 3: Arc Eternal",
+    ["cyberdrome-win64-shipping"] = "Cyberdrome",
+    ["cyphers"] = "Cyphers",
+    ["dandara"] = "Dandara",
+    ["daorigins"] = "Dragon Age: Origins",
+    ["daou_updateaddinsxml_steam"] = "Dragon Age: Origins - Ultimate Edition",
+    ["darkapp"] = "Dark",
+    ["darkcrusade"] = "Warhammer 40,000: Dawn of War - Dark Crusade",
+    ["darknessii"] = "Darkness 2",
+    ["darksiders1"] = "Darksiders Warmastered Edition",
+    ["darksiders2"] = "Darksiders 2",
+    ["darksiderspc"] = "Darksiders",
+    ["darksouls"] = "Dark Souls",
+    ["darksoulsii"] = "Dark Souls 2",
+    ["darksoulsiii"] = "DARK SOULS III",
+    ["darksoulsremastered"] = "DARK SOULS™: REMASTERED",
+    ["darkstarone"] = "DarkStar One",
+    ["darwin"] = "Darwin Project",
+    ["darwin-win64-shipping"] = "Darwin Project - Open Beta",
+    ["darwinia"] = "Darwinia",
+    ["data"] = "Dark Souls",
+    ["dauntless-win64-shipping"] = "Dauntless",
+    ["dave"] = "Dangerous Dave",
+    ["dayofinfamy_be"] = "Day of Infamy",
+    ["dayz"] = "Day Z",
+    ["dayz_x64"] = "DayZ",
+    ["dbfighterz"] = "DRAGON BALL FighterZ",
+    ["dbxv"] = "Dragon Ball XenoVerse",
+    ["dbxv2"] = "Dragon Ball Xenoverse 2",
+    ["dcgame"] = "DC Universe Online",
+    ["dcs"] = "DCS World",
+    ["ddadds"] = "Dream Daddy: A Dad Dating Simulator",
+    ["ddda"] = "Dragon's Dogma: Dark Arisen",
+    ["ddo"] = "Dragon's Dogma Online",
+    ["dead space"] = "Dead Space™",
+    ["deadage"] = "Dead Age",
+    ["deadbydaylight-win64-shipping"] = "Dead by Daylight",
+    ["deadcells"] = "Dead Cells",
+    ["deadeffect"] = "Dead Effect",
+    ["deadfrontier2"] = "Dead Frontier 2",
+    ["deadislandgame"] = "Dead Island",
+    ["deadislandgame_x86_rwdi"] = "Dead Island Riptide",
+    ["deadislandriptidegame"] = "Dead Island Riptide Definitive Edition",
+    ["deadlock"] = "Deadlock",
+    ["deadly30"] = "Deadly 30",
+    ["deadmaze"] = "Dead Maze",
+    ["deadrising2"] = "Dead Rising 2",
+    ["deadrising3"] = "Dead Rising 3",
+    ["deadspace2"] = "Dead Space 2",
+    ["dearesther"] = "Dear Esther",
+    ["deathspank"] = "DeathSpank",
+    ["deathspanktov"] = "DeathSpank - Thongs of Virtue",
+    ["deblob"] = "de Blob",
+    ["deblob2"] = "de Blob 2",
+    ["deceit"] = "Deceit",
+    ["deep space waifu"] = "DEEP SPACE WAIFU",
+    ["defensegrid2_release"] = "Defense Grid 2",
+    ["deltaforceclient-win64-shipping"] = "Delta Force",
+    ["democracy3"] = "Democracy 3",
+    ["deponia"] = "Deponia: The Complete Journey",
+    ["deponia2"] = "Chaos on Deponia",
+    ["depressionquest"] = "Depression Quest",
+    ["depthgame"] = "Depth",
+    ["descenders"] = "Descenders",
+    ["descent"] = "Descent Underground",
+    ["desertsofkharak32"] = "Desert of Kharak",
+    ["desertsofkharak64"] = "Desert of Kharak",
+    ["destiny2"] = "Destiny 2",
+    ["detection"] = "Assassin's Creed",
+    ["deusex"] = "Deus Ex",
+    ["deusex_steam"] = "Deus Ex: The Fall",
+    ["devenv"] = "Visual Studio",
+    ["devilmaycry4_dx10"] = "Devil May Cry 4",
+    ["devilmaycry4_dx9"] = "Devil May Cry 4",
+    ["devilmaycry4specialedition"] = "Devil May Cry 4",
+    ["devimaycry4"] = "Devil May Cry 4",
+    ["devimaycry5"] = "Devil May Cry 5",
+    ["df"] = "Delta Force 1",
+    ["dfbhd"] = "Delta Force: Black Hawk Down",
+    ["dflw"] = "Delta Force: Land Warrior",
+    ["dfo"] = "Dungeon Fighter Online",
+    ["dftfd"] = "Delta Force: Task Force Dagger",
+    ["dfubg"] = "S.K.I.L.L. - Special Force 2",
+    ["dfuw"] = "Darkfall: Unholy Wars",
+    ["diablo"] = "Diablo",
+    ["diablo ii"] = "Diablo II",
+    ["diablo iii"] = "Diablo 3",
+    ["diablo iii64"] = "Diablo III",
+    ["diadraempty"] = "Diadra Empty",
+    ["diadraempty154lw"] = "Diadra Empty",
+    ["diadraempty154plus"] = "Diadra Empty",
+    ["dinodday"] = "Dino D-Day",
+    ["dinohordegame"] = "ORION: Prelude",
+    ["directus3d"] = "Directus",
+    ["dirt2_game"] = "DiRT 2",
+    ["dirt3"] = "Dirt 3",
+    ["dirt3_game"] = "DiRT 3 Complete Edition",
+    ["dirt4"] = "DiRT 4",
+    ["disasm"] = "World of Guns: Gun Disassembly",
+    ["disco dodgeball"] = "Robot Roller-Derby Disco Dodgeball",
+    ["dishonored"] = "Dishonored",
+    ["dishonored2"] = "Dishonored 2",
+    ["disneyinfinity2"] = "Disney Infinity",
+    ["disneyinfinity3"] = "Disney Infinity",
+    ["dividebysheep"] = "Divide By Sheep",
+    ["dlpc"] = "Yu-Gi-Oh! Duel Links",
+    ["dmc-devilmaycry"] = "DmC - Devil May Cry",
+    ["dndclient"] = "Dungeons & Dragons Online",
+    ["dnf"] = "Dungeon & Fighter",
+    ["dnl"] = "Dark and Light",
+    ["dofus"] = "Dofus",
+    ["dom"] = "Dawn of Midgard",
+    ["domina"] = "Domina",
+    ["dominions4"] = "Dominions 4",
+    ["dontstarve_steam"] = "Don't Starve",
+    ["donttouchanything"] = "Please, Don't Touch Anything",
+    ["donutcounty"] = "Donut County",
+    ["doom"] = "Doom 3",
+    ["doomx64"] = "DOOM 2016",
+    ["doomx64vk"] = "DOOM 2016",
+    ["doorkickers"] = "Door Kickers",
+    ["dota"] = "DOTA",
+    ["dota2"] = "Dota 2",
+    ["dotp_d14"] = "Magic the Gathering 2014",
+    ["doubledragon"] = "Double Dragon Neon",
+    ["dow2"] = "Warhammer 40,000: Dawn of War 2",
+    ["downwell"] = "Downwell",
+    ["dqxgame"] = "Dragon Quest X: Mezameshi Itsutsu no Shuzoku Online",
+    ["dragonage2"] = "Dragon Age 2",
+    ["dragonageinquisition"] = "Dragon Age: Inquisition",
+    ["dragonfall"] = "Shadowrun: Dragonfall",
+    ["dragonfinsoup"] = "Dragon Fin Soup",
+    ["dragonnest"] = "Dragon Nest",
+    ["dreadgame-win64-shipping"] = "Dreadnought",
+    ["dreamfall chapters"] = "Dreamfall Chapters: The Longest Journey",
+    ["drift racing online"] = "CarX Drift Racing Online",
+    ["drlangeskov"] = "Dr Langeskov, The Tiger, and The Terribly Cursed Emerald: A Whirlwind Heist",
+    ["drt"] = "DiRT Rally",
+    ["dubdash"] = "Dub Dash",
+    ["duckgame"] = "Duck Game",
+    ["ducktales"] = "DuckTales Remastered",
+    ["duelyst"] = "Duelyst",
+    ["duke3d"] = "Duke Nukem 3D",
+    ["dukeforever"] = "Duke Nukem Forever",
+    ["dundefgame"] = "Dungeon Defenders 2",
+    ["dungeon"] = "Soda Dungeon",
+    ["dungeon siege iii"] = "Dungeon Siege 3",
+    ["dungeoneering"] = "Guild of Dungeoneering",
+    ["dungeonland"] = "Dungeonland",
+    ["dungeonoftheendless"] = "Dungeon of the Endless",
+    ["dungeons2"] = "Dungeons 2",
+    ["dungeonsiege"] = "Dungeon Siege",
+    ["dungeonsiege2"] = "Dungeon Siege 2",
+    ["dungreed"] = "Dungreed",
+    ["dustaet"] = "Dust: An Elysian Tail",
+    ["dustforce"] = "Dustforce",
+    ["dwarves"] = "The Dwarves",
+    ["dxb"] = "Deus Ex: Breach",
+    ["dxhr"] = "Deus Ex: Human Revolution",
+    ["dxhrdc"] = "Deus Ex: Human Revolution",
+    ["dxmd"] = "Deus Ex: Mankind Divided™",
+    ["dyinglightgame"] = "Dying Light",
+    ["earth"] = "Google Earth VR",
+    ["eco"] = "Eco",
+    ["ed6_win"] = "The Legend of Heroes: Trails in the Sky",
+    ["ed6_win2"] = "Trails in the Sky SC",
+    ["edf41"] = "EARTH DEFENSE FORCE 4.1  The Shadow of New Despair",
+    ["edlaunch"] = "Elite: Dangerous",
+    ["edna"] = "Edna & Harvey: The Breakout",
+    ["eee"] = "Ed, Edd n Eddy: The Mis-Edventures",
+    ["electronicobserver"] = "Kantai Collection",
+    ["elex"] = "ELEX",
+    ["elitedangerous32"] = "Elite: Dangerous",
+    ["elitedangerous64"] = "Elite: Dangerous",
+    ["elsword"] = "Elsword",
+    ["emily is away"] = "Emily is Away",
+    ["empire"] = "Empire: Total War",
+    ["empires2"] = "Age of Empires 2",
+    ["empyrion"] = "Empyrion - Galactic Survival",
+    ["endlesslegend"] = "Endless Legend",
+    ["endlessspace2"] = "Endless Space 2",
+    ["engine"] = "F.E.A.R.",
+    ["enslaved"] = "Enslaved:Odyssey to the West",
+    ["entropia"] = "Entropia Universe",
+    ["eocapp"] = "Divinity: Original Sin",
+    ["eqgame"] = "EverQuest",
+    ["escapedeadisland"] = "Escape Dead Island",
+    ["escapefromtarkov"] = "Escape from Tarkov",
+    ["eseaclient"] = "ESEA",
+    ["eso"] = "The Elder Scrolls Online",
+    ["eso64"] = "The Elder Scrolls Online",
+    ["essteam"] = "Elsword",
+    ["et"] = "Wolfenstein: Enemy Territory",
+    ["eternal"] = "Eternal Card Game",
+    ["eternalcrusadeclient"] = "Warhammer 40,000: Eternal Crusade",
+    ["etg"] = "Enter the Gungeon",
+    ["ethancarter-win64-shipping"] = "The Vanishing of Ethan Carter Redux",
+    ["eu4"] = "Europa Universalis IV",
+    ["europa1400gold_tl"] = "The Guild Gold Edition",
+    ["eurotrucks2"] = "Euro Truck Simulator 2",
+    ["event0"] = "Event[0]",
+    ["everlasting summer"] = "Everlasting Summer",
+    ["everquest2"] = "EverQuest 2",
+    ["evilwithin"] = "The Evil Within",
+    ["evoland2"] = "Evoland 2",
+    ["evolve"] = "Evolve Stage 2",
+    ["execpubg"] = "PUBG",
+    ["exefile"] = "Eve Online",
+    ["expendabros"] = "The Expendabros",
+    ["eye"] = "E.Y.E.: Divine Cybermancy",
+    ["ezquake-gl"] = "EZ Quake",
+    ["f.e.a.r. 3"] = "F.E.A.R. 3",
+    ["f13"] = "Friday the 13th: Killer Puzzle",
+    ["f1_2015"] = "F1 2015",
+    ["f1_2016"] = "F1 2016",
+    ["f1_2017"] = "F1 2017",
+    ["fable"] = "Fable: The Lost Chapters",
+    ["fable anniversary"] = "Fable Anniversary",
+    ["factorio"] = "Factorio",
+    ["factorygame"] = "Satisfactory",
+    ["factorygame-win64-shipping"] = "Satisfactory",
+    ["satisfactory"] = "Satisfactory",
+    ["faeria"] = "Faeria",
+    ["fairyfencer"] = "Fairy Fencer F",
+    ["fallout2"] = "Fallout 2",
+    ["fallout2hr"] = "Fallout 2",
+    ["fallout3"] = "Fallout 3",
+    ["fallout4"] = "Fallout 4",
+    ["fallout4vr"] = "Fallout 4 VR",
+    ["falloutnv"] = "Fallout: New Vegas",
+    ["falloutshelter"] = "Fallout Shelter",
+    ["falloutw"] = "Fallout",
+    ["fancy_skulls"] = "Fancy Skulls",
+    ["farcry2"] = "Far Cry 2",
+    ["farcry3"] = "Far Cry 3",
+    ["farcry3_d3d11"] = "Far Cry® 3",
+    ["farcry4"] = "Far Cry 4",
+    ["farcry5"] = "Far Cry 5",
+    ["farmingsimulator2015game"] = "Farming Simulator 15",
+    ["farmingsimulator2017game"] = "Farming Simulator 17",
+    ["farmtogether"] = "Farm Together",
+    ["fc3_blooddragon_d3d11_b"] = "Far Cry 3 Blood Dragon",
+    ["fceux"] = "Nintendo Emulator",
+    ["fcsplash"] = "Far Cry Primal",
+    ["fear"] = "F.E.A.R.",
+    ["fear2"] = "F.E.A.R. 2: Project Origin",
+    ["fearxp"] = "F.E.A.R.",
+    ["feed and grow"] = "Feed and Grow: Fish",
+    ["fenris-win64-shipping"] = "Fortified",
+    ["fez"] = "FEZ",
+    ["ff6"] = "FINAL FANTASY VI",
+    ["ff7_en"] = "Final Fantasy VII",
+    ["ff8_en"] = "Final Fantasy VIII",
+    ["ffr"] = "Flash Flash Revolution",
+    ["ffv_game"] = "Final Fantasy V",
+    ["ffx"] = "Final Fantasy X",
+    ["ffx-2"] = "Final Fantasy X-2",
+    ["ffxiii2"] = "Final Fantasy XIII-2",
+    ["ffxiiiimg"] = "Final Fantasy XIII",
+    ["ffxiv"] = "FINAL FANTASY XIV",
+    ["ffxiv_dx11"] = "FINAL FANTASY XIV",
+    ["ffxv_s"] = "FINAL FANTASY XV WINDOWS EDITION",
+    ["fifa"] = "FIFA 11 and 12",
+    ["fifa10"] = "FIFA 10",
+    ["fifa13"] = "FIFA 13",
+    ["fifa14"] = "FIFA 14",
+    ["fifa15"] = "FIFA 15",
+    ["fifa16"] = "FIFA 16",
+    ["fifa17"] = "FIFA 17",
+    ["fifa18"] = "FIFA 18",
+    ["final_exam"] = "Final Exam",
+    ["firefallclient"] = "Firefall",
+    ["firewatch"] = "Firewatch",
+    ["fishingplanet"] = "Fishing Planet",
+    ["fivenightsatfreddys"] = "Five Nights at Freddy's",
+    ["fivenightsatfreddys2"] = "Five Nights at Freddy's 2",
+    ["flagac4bfsp"] = "Assassin's Creed IV: Black Flag",
+    ["flamebreak"] = "Flamebreak",
+    ["flexdemorelease"] = "FLEX",
+    ["fm"] = "Football Manager 2018",
+    ["forgettabledungeon"] = "The Forgettable Dungeon",
+    ["forhonor"] = "For Honor",
+    ["fortify"] = "FORTIFY",
+    ["fortniteclient-win64-shipping"] = "Fortnite",
+    ["fortniteclient-win64-shipping_be"] = "Fortnite",
+    ["forts"] = "Forts",
+    ["fouc"] = "FlatOut Ultimate Carnage",
+    ["foxgame-win32-shipping"] = "Blacklight: Retribution",
+    ["foxgame-win32-shipping_be"] = "Blacklight: Retribution",
+    ["fp"] = "Freedom Planet",
+    ["fractured space"] = "Fractured Space",
+    ["freeman guerrilla warfare"] = "Freeman: Guerrilla Warfare",
+    ["freestyle2"] = "Freestyle Basketball 2",
+    ["from_dust"] = "From Dust",
+    ["from_the_depths"] = "From The Depths",
+    ["frontend"] = "Tiger Knight",
+    ["frontmissionevolved"] = "Front Mission Evolved",
+    ["frostpunk"] = "Frostpunk",
+    ["frostrunner-win64-shipping"] = "FrostRunner",
+    ["fsasgame"] = "Secret Files 3",
+    ["fsd-win64-shipping"] = "Deep Rock Galactic",
+    ["fsw2"] = "Full Spectrum Warrior: Ten Hammers",
+    ["fsx"] = "Microsoft Flight Simulator X: Steam Edition",
+    ["ftk"] = "For The King",
+    ["ftlgame"] = "FTL: Faster Than Light",
+    ["funnyfarm"] = "Toontown's Funny Farm",
+    ["furi"] = "Furi",
+    ["fusion"] = "Kega Fusion",
+    ["future soldier"] = "Tom Clancy's Ghost Recon: Future Solider",
+    ["future soldier dx11"] = "Tom Clancy's Ghost Recon Future Soldier",
+    ["futurewars"] = "Future Wars",
+    ["gahkthun"] = "Gahkthun of the Golden Lightning",
+    ["galciv2"] = "Galactic Civilization 2",
+    ["galciv3"] = "Galactic Civilization 3",
+    ["game"] = "The Red Solstice",
+    ["gameclient"] = "Horizon Source",
+    ["gameguard.des"] = "Metin2",
+    ["gamemd"] = "Command & Conquer: Red Alert 2",
+    ["gameroyale2"] = "Game Royale 2 - The Secret of Jannis Island",
+    ["gamewin32retailsteam"] = "Riptide GP2",
+    ["gang beasts"] = "Gang Beasts",
+    ["garden"] = "Garden",
+    ["gc2twilightofthearnor"] = "Galactic Civilizations II: Ultimate Edition",
+    ["ge"] = "Granado Espada",
+    ["ge2rb"] = "GOD EATER 2 Rage Burst",
+    ["generals"] = "Command & Conquer™: Generals and Zero Hour",
+    ["genitaljousting"] = "Genital Jousting",
+    ["geometrydash"] = "Geometry Dash",
+    ["geometrywars"] = "Geometry Wars",
+    ["gettingoverit"] = "Getting Over It with Bennett Foddy",
+    ["getwrecked"] = "Wrecked",
+    ["ggxxacpr_win"] = "Guilty Gear XX Accent Core Plus R",
+    ["gh3"] = "Guitar Hero III: Legends of Rock",
+    ["ghostrecon"] = "Tom Clancy's Ghost Recon",
+    ["ghwt"] = "Guitar Hero World Tour",
+    ["gizmo_game-win64-shipping"] = "Gizmo",
+    ["gjl"] = "Galactic Junk League",
+    ["glquake"] = "Quake",
+    ["glyphclientapp"] = "Trove",
+    ["gn_enbu"] = "Touhou Puppet Dance Performance",
+    ["goatgame-win32-shipping"] = "Goat Simulator",
+    ["godmode"] = "God Mode",
+    ["goldrushthegame"] = "Gold Rush: The Game",
+    ["golf with your friends"] = "Golf With Your Friends",
+    ["golfit-win64-shipping"] = "Golf It!",
+    ["gonner"] = "GoNNER",
+    ["goog"] = "Grey Goo",
+    ["gop3"] = "Governor of Poker 3",
+    ["gorn"] = "GORN",
+    ["gp5"] = "Guitar Pro 5",
+    ["grandia2"] = "Grandia 2",
+    ["graveyard keeper"] = "Graveyard Keeper",
+    ["grb"] = "Tom Clancy's Ghost Recon Breakpoint",
+    ["greed"] = "Greed: Black Border",
+    ["grickle101"] = "Puzzle Agent",
+    ["grickle102"] = "Puzzle Agent 2",
+    ["grid"] = "Grid",
+    ["grid2"] = "Grid 2",
+    ["grid2_avx"] = "GRID 2",
+    ["gridautosport_avx"] = "GRID: Autosport",
+    ["grim dawn"] = "Grim Dawn",
+    ["grimfandango"] = "Grim Fandango",
+    ["grip-win64-shipping"] = "GRIP",
+    ["grisaia"] = "Grisaia no Kajitsu",
+    ["growhome"] = "Grow Home",
+    ["grw"] = "Tom Clancy's Ghost Recon Wildlands",
+    ["gta--vc"] = "Grand Theft Auto: Vice City",
+    ["gta-sa"] = "Grand Theft Auto San Andreas",
+    ["gta-vc"] = "Grand Theft Auto: Vice City",
+    ["gta3"] = "Grand Theft Auto III",
+    ["gta5"] = "Grand Theft Auto V",
+    ["gta_sa"] = "Grand Theft Auto: San Andreas",
+    ["gtaiv"] = "Grand Theft Auto IV",
+    ["guac"] = "Guacamelee",
+    ["guild-quest"] = "Guild Quest",
+    ["guild3"] = "The Guild 3",
+    ["guildii"] = "The Guild II",
+    ["guiltygearxrd"] = "Guilty Gear Xrd -SIGN-",
+    ["guitarpro"] = "Guitar Pro 6",
+    ["guitarpro7"] = "Guitar Pro 7",
+    ["gunpoint"] = "Gunpoint",
+    ["guns up"] = "GUNS UP!",
+    ["gunsnboxes"] = "Guns N' Boxes",
+    ["gunsoficarusonline"] = "Guns of Icarus - Online",
+    ["gunz2_steam"] = "GunZ 2: The Second duel",
+    ["gw"] = "Guild Wars",
+    ["gw2"] = "Guild Wars 2",
+    ["gw2-64"] = "Guild Wars 2",
+    ["gw2.main_win64_retail"] = "Plants vs Zombies GW2",
+    ["gw3"] = "Geometry Wars 3",
+    ["gwent"] = "Gwent",
+    ["gzdoom - play brutal doom"] = "Brutal Doom",
+    ["gzwclientsteam-win64-shipping"] = "Gray Zone Warfare",
+    ["h1z1"] = "H1Z1",
+    ["h5_game"] = "Might and Magic - Heroes V",
+    ["hackerevolution"] = "Hacker Evolution",
+    ["hacknet"] = "Hacknet",
+    ["halfdead"] = "Half dead",
+    ["halo_online"] = "Halo Online",
+    ["hammerwatch"] = "Hammerwatch",
+    ["hand simulator"] = "Hand Simulator",
+    ["happrentice"] = "Houdini",
+    ["harry2"] = "LEGO Harry Potter: Years 5-7",
+    ["harvey"] = "Edna & Harvey: Harvey's New Eyes",
+    ["hatintimegame"] = "A Hat in Time",
+    ["hatoful"] = "Hatoful Boyfriend",
+    ["hawkengame-win32-shipping"] = "Hawken",
+    ["hawx"] = "Tom Clancy's H.A.W.X",
+    ["hawx2"] = "Tom Clancy's H.A.W.X 2",
+    ["hawx2_dx11"] = "Tom Clancy's H.A.W.X 2",
+    ["hawx_dx10"] = "Tom Clancy's H.A.W.X DX10",
+    ["hcb"] = "Hyper Color Ball",
+    ["hearthstone"] = "Hearthstone",
+    ["heat_signature"] = "Heat Signature",
+    ["heavyweapon"] = "Heavy Weapon",
+    ["hellbladegame"] = "Hellblade: Senua's Sacrifice",
+    ["hellbladegame-win64-shipping"] = "Hellblade: Senua's Sacrifice",
+    ["hellbound-win64-shipping"] = "Hellbound: Survival Mode",
+    ["helldivers"] = "HELLDIVERS™",
+    ["hellion"] = "HELLION",
+    ["herald"] = "Herald: An Interactive Period Drama",
+    ["hero_siege"] = "Hero Siege",
+    ["heroes"] = "마비노기 영웅전",
+    ["heroesandgeneralsdesktop"] = "Heroes & Generals",
+    ["heroesofthestorm"] = "Heroes of the Storm",
+    ["heroesofthestorm_x64"] = "Heroes of the Storm",
+    ["hex"] = "Hex: Shards of Fate",
+    ["hexpatch"] = "Hex: Shards of Fate",
+    ["hhfirstride_09_02_2018_17_28"] = "Hitchhiker",
+    ["hideandshriek-win64-shipping"] = "Hide and Shriek",
+    ["highoctanedrift"] = "High Octane Drift",
+    ["hillclimbracing.windows"] = "Hill Climb Racing",
+    ["hindie"] = "Houdini",
+    ["hiveswap-act1"] = "HIVESWAP: ACT 1",
+    ["hkship"] = "Sleeping Dogs",
+    ["hl"] = "Half-Life: C.A.G.E.D.",
+    ["hl2"] = "Team Fortress 2",
+    ["hl2hl2"] = "Half Life 2",
+    ["hl2p"] = "Portal",
+    ["hl2tf"] = "Team Fortress 2",
+    ["hma"] = "Hitman: Absolution",
+    ["hmm"] = "Heavy Metal Machines",
+    ["hng"] = "Heroes and Generals",
+    ["hoi4"] = "Hearts of Iron IV",
+    ["holdfast naw"] = "Holdfast: Nations At War",
+    ["hollow_knight"] = "Hollow Knight",
+    ["holodrive"] = "Holodrive",
+    ["holyavatarvs"] = "Holy Avatar vs. Maidens of the Dead",
+    ["hom"] = "Hero of Many",
+    ["homefront"] = "Homefront",
+    ["homefront2_release"] = "Homefront: The Revolution",
+    ["hon"] = "Heroes of Newerth",
+    ["horizonforbiddenwest"] = "Horizon Forbidde West",
+    ["horseshoes & hand grenades"] = "Hot Dogs",
+    ["hotlava"] = "Hot Lava",
+    ["hotlinegl"] = "Hotline Miami",
+    ["hotlinemiami"] = "Hotline Miami",
+    ["hotlinemiami2"] = "Hotline Miami 2: Wrong Number",
+    ["houseflipper"] = "House Flipper",
+    ["houseparty"] = "House Party",
+    ["howtosurvive"] = "How to survive",
+    ["howtosurvive2"] = "How to Survive 2",
+    ["human"] = "Human: Fall Flat",
+    ["hungerdungeon"] = "Hunger Dungeon",
+    ["huniecamstudio"] = "HunieCam Studio",
+    ["huniepop"] = "HuniePop",
+    ["hunt"] = "Hunt: Showdown",
+    ["huntgame"] = "Hunt: Showdown",
+    ["hurtworld"] = "Hurtworld",
+    ["hurtworldclient"] = "Hurtworld",
+    ["hwr"] = "Heroes of Hammerwatch",
+    ["hydropc"] = "Hydrophobia: Prophecy",
+    ["hyperlightdrifter"] = "Hyper Light Drifter",
+    ["iamalive_game"] = "I Am Alive",
+    ["iamweaponrevival"] = "I am weapon: Revival",
+    ["ibbobb"] = "ibb & obb",
+    ["ic"] = "Impossible Creatures",
+    ["icarus-win64-shipping"] = "Icarus",
+    ["idledragons"] = "Idle Champions of the Forgotten Realms",
+    ["ige_wpf64"] = "Far Cry 4",
+    ["impossiblegame"] = "The Impossible Game",
+    ["in between"] = "In Between",
+    ["infantry"] = "Infantry",
+    ["injustice"] = "Injustice: Gods Among Us Ultimate Edition",
+    ["injustice2"] = "Injustice 2",
+    ["insanity-win32-shipping"] = "Afterfall Insanity:Extended Edition",
+    ["inside"] = "Inside",
+    ["insulam-win64-shipping"] = "Estranged: Act II",
+    ["insurgency"] = "Insurgency",
+    ["insurgencyclient-win64-shipping"] = "Insurgency: Sandstorm",
+    ["invisibleinc"] = "Invisible Inc.",
+    ["ionbranch_be"] = "Islands of Nyne: Battle Royale",
+    ["iracingsim"] = "iRacing",
+    ["iracingsim64"] = "iRacing",
+    ["ironsnout"] = "Iron Snout",
+    ["isaac"] = "The Binding of Isaac",
+    ["isaac-ng"] = "The Binding of Isaac: Rebirth",
+    ["istrolid"] = "Istrolid",
+    ["iw3mp"] = "Call of Duty: Modern Warfare",
+    ["iw3sp"] = "Call of Duty: Modern Warfare",
+    ["iw4mp"] = "Call of Duty: Modern Warfare 2 - Multiplayer",
+    ["iw4sp"] = "Call of Duty: Modern Warfare 2",
+    ["iw5mp"] = "Call of Duty: Modern Warfare 3 - Multiplayer",
+    ["iw5sp"] = "Call of Duty: Modern Warfare 3",
+    ["iw6mp64_ship"] = "Call of Duty Ghosts: Multiplayer",
+    ["iw6sp64_ship"] = "Call of Duty: Ghosts",
+    ["iw7_ship"] = "Call of Duty: Infinite Warfare",
+    ["iwbtgbeta(fs)"] = "I Wanna Be The Guy",
+    ["iwbtgbeta(slomo)"] = "I Wanna Be The Guy",
+    ["jalopy"] = "Jalopy",
+    ["jamp"] = "Star Wars Jedi Knight",
+    ["jasp"] = "STAR WARS™ Jedi Knight: Jedi Academy™",
+    ["javaw"] = "Minecraft",
+    ["jd2017"] = "Just Dance 2017",
+    ["jk2mp"] = "Star Wars Jedi Knight II",
+    ["jk2mvmp_x64"] = "Star Wars Jedi Knight II",
+    ["jk2mvmp_x86"] = "Star Wars Jedi Knight II",
+    ["joar"] = "Journey of a Roach",
+    ["joshua"] = "SuperPower 2",
+    ["jurassicpark100"] = "Jurassic Park: The Game",
+    ["justcause"] = "Just Cause",
+    ["justcause2"] = "Just Cause 2",
+    ["justcause3"] = "Just Cause 3",
+    ["justfishing"] = "Just Fishing",
+    ["justice_league_vr_the_complete_experience-1.0.1-htcvive-release"] = "Justice League VR: The Complete Experience",
+    ["jwe"] = "Jurassic World Evolution",
+    ["kag"] = "King Arthur's Gold",
+    ["kancolleviewer"] = "KanColle",
+    ["kaneandlynch"] = "Kane and Lynch: Dead Men",
+    ["kathyrain"] = "Kathy Rain",
+    ["kenshi_x64"] = "Kenshi",
+    ["keystonepublic.x64"] = "Keystone",
+    ["kfgame"] = "Killing Floor 2",
+    ["kidgame"] = "Killer Is Dead - Nightmare Edition",
+    ["killingfloor"] = "Killing Floor",
+    ["king's quest 1 sci"] = "King's Quest I",
+    ["king's quest 2"] = "King's Quest II",
+    ["king's quest 3"] = "King's Quest III",
+    ["king's quest 4"] = "King's Quest IV",
+    ["king's quest 5"] = "King's Quest V",
+    ["king's quest 6 win"] = "King's Quest VI",
+    ["king's quest 7"] = "King's Quest VII",
+    ["kingdom"] = "Kingdom: New Lands",
+    ["kingdomcome"] = "Kingdom Come: Deliverance",
+    ["kingdomsandcastles"] = "Kingdoms and Castles",
+    ["kingoffighters2002um"] = "The King Of Fighters 2002 Unlimited Match",
+    ["kofxiii"] = "The King of Fighters XIII",
+    ["kopp2"] = "Knights of Pen & Paper II",
+    ["kritika_client"] = "Kritika Online",
+    ["kshootmania"] = "K-Shoot Mania",
+    ["ksp"] = "Kerbal Space Program",
+    ["ksp_x64"] = "Kerbal Space Program",
+    ["ktane"] = "Keep Talking and Nobody Explodes",
+    ["l2"] = "Lineage II",
+    ["landmark64"] = "Landmark",
+    ["lanoire"] = "L.A. Noire",
+    ["lanpatcher"] = "L.A. Noire",
+    ["launchgtaiv"] = "Grand Theft Auto IV",
+    ["launchpad"] = "Just Survive",
+    ["lawbreakers"] = "LawBreakers",
+    ["layers of fear"] = "Layers of Fear",
+    ["lcgol"] = "Lara Croft and the Guardian of Light",
+    ["leagueclientux"] = "League of Legends",
+    ["learn to fly 3"] = "Learn to Fly 3",
+    ["left4dead"] = "Left 4 Dead",
+    ["left4dead2"] = "Left 4 Dead 2",
+    ["lego_worlds_dx11"] = "LEGO® Worlds",
+    ["legobatman"] = "LEGO Batman",
+    ["legobatman2"] = "LEGO® Batman 2 DC Super Heroes™",
+    ["legoemmet"] = "The LEGO® Movie - Videogame",
+    ["legoharrypotter"] = "LEGO Harry Potter: Years 1-4",
+    ["legohobbit"] = "LEGO: The Hobbit",
+    ["legohobbit_dx11"] = "LEGO: The Hobbit",
+    ["legoindy"] = "LEGO Indiana Jones: The Original Adventures",
+    ["legojurassicworld_dx11"] = "LEGO® Jurassic World",
+    ["legomarvel"] = "LEGO® MARVEL Super Heroes",
+    ["legomarvelavengers_dx11"] = "LEGO® MARVEL's Avengers",
+    ["legoninjago_dx11"] = "The LEGO® NINJAGO® Movie Video Game",
+    ["legopirates"] = "LEGO Pirates of the Caribbean: The Video Game",
+    ["legostarwarssaga"] = "LEGO® Star Wars™: The Complete Saga",
+    ["legoswtfa_dx11"] = "LEGO® STAR WARS™: The Force Awakens",
+    ["lethalleague"] = "Lethal League",
+    ["letthemcome"] = "Let Them Come",
+    ["life is strange - before the storm"] = "Life is Strange: Before the Storm",
+    ["lifeisstrange"] = "Life Is Strange",
+    ["lightroom"] = "Adobe Lightroom",
+    ["limbo"] = "Limbo",
+    ["lineage"] = "Lineage",
+    ["lineageii"] = "Lineage II",
+    ["lisa"] = "LISA",
+    ["littlenightmares"] = "Little Nightmares",
+    ["llo_beta2"] = "Love Live Online",
+    ["lms"] = "Last Man Standing",
+    ["loadout"] = "Loadout",
+    ["locksquest"] = "Lock's Quest",
+    ["lol"] = "League of Legends",
+    ["lolclient"] = "League of Legends",
+    ["long live santa"] = "Long Live Santa!",
+    ["longlivethequeen"] = "Long Live The Queen",
+    ["looterkings"] = "Looterkings",
+    ["lordsofthefallen"] = "Lords of the Fallen",
+    ["lost_castle"] = "Lost Castle",
+    ["losthorizon2"] = "Lost Horizon 2",
+    ["lostsaga"] = "Lost Saga",
+    ["lotdgame"] = "Deadlight",
+    ["lotroclient"] = "Lord of the Rings Online",
+    ["love"] = "Move or Die",
+    ["lovelyplanet"] = "Lovely Planet",
+    ["loversinadangerousspacetime"] = "Lovers in a Dangerous Spacetime",
+    ["lr2"] = "Lunatic Rave 2",
+    ["lr2body"] = "Lunatic Rave 2",
+    ["lrff13"] = "LIGHTNING RETURNS: FINAL FANTASY XIII",
+    ["lro"] = "Limit Ragnarok Online",
+    ["lsgame_be"] = "Line of Sight",
+    ["lss"] = "Loading Screen Simulator",
+    ["lumini_win64"] = "Lumini",
+    ["lyne"] = "LYNE",
+    ["m1-win64-shipping"] = "The First Descendant",
+    ["mabinogi"] = "Mabinogi",
+    ["madmachines"] = "Mad Machines",
+    ["madmax"] = "Mad Max",
+    ["mafia2"] = "Mafia 2",
+    ["mafia3"] = "Mafia III",
+    ["magicduels"] = "Magic Duels",
+    ["magicite"] = "Magicite",
+    ["magicka"] = "Magicka",
+    ["magicka2"] = "Magicka 2",
+    ["main"] = "BLOCKADE 3D",
+    ["maniaplanet"] = "TrackMania² Stadium",
+    ["maplestory"] = "MapleStory",
+    ["maplestory2"] = "MapleStory 2",
+    ["marssteam"] = "Surviving Mars",
+    ["marvel-win64-shipping"] = "Marvel Rivals",
+    ["marvelheroes2015"] = "Marvel Heroes 2015",
+    ["marvelheroes2016"] = "Marvel Heroes 2016",
+    ["masseffect"] = "Mass Effect",
+    ["masseffect2"] = "Mass Effect 2",
+    ["masseffect3"] = "Mass Effect 3",
+    ["masseffect3demo"] = "Mass Effect 3",
+    ["masseffectandromeda"] = "Mass Effect™: Andromeda",
+    ["masterreboot"] = "Master Reboot",
+    ["maxpayne3"] = "Max Payne 3",
+    ["maya"] = "Autodesk Maya",
+    ["mb_warband"] = "Mount & Blade: Warband",
+    ["mb_wfas"] = "Mount & Blade: With Fire and Sword",
+    ["mba"] = "Magical Battle Arena",
+    ["mbaa"] = "Melty Blood Actress Again: Current Code",
+    ["mban_f"] = "Magical Battle Arena NEXT",
+    ["mban_m"] = "Magical Battle Arena NEXT",
+    ["mcengine"] = "McOsu",
+    ["me2game"] = "Mass Effect™ 2",
+    ["mechwarrioronline"] = "MechWarrior Online",
+    ["mechwarrioronline.exe"] = "Mech Warrior Online",
+    ["medieval2"] = "Medieval II: Total War",
+    ["medievalengineers"] = "Medieval Engineers",
+    ["memoria"] = "Memoria",
+    ["menofvalor"] = "Men of Valor",
+    ["meridian - new world"] = "Meridian: New World",
+    ["metal gear rising revengeance"] = "Metal Gear Rising: Revengeance",
+    ["meteor60seconds"] = "Meteor 60 Seconds!",
+    ["metro"] = "Metro Redux",
+    ["metro2033"] = "Metro 2033",
+    ["metroconflict"] = "Metro Conflict: The Origin",
+    ["metroexodus"] = "Metro Exodus",
+    ["metroll"] = "Metro Last Light",
+    ["metronomicon"] = "The Metronomicon: Slay The Dance Floor",
+    ["mgs2_sse"] = "Metal Gear Solid 2: Substance",
+    ["mgsgroundzeroes"] = "Metal Gear Solid V: Ground Zeroes",
+    ["mgsi"] = "Metal Gear Solid",
+    ["mgsvmgo"] = "Metal Gear Online 3",
+    ["mgsvtpp"] = "METAL GEAR SOLID V: THE PHANTOM PAIN",
+    ["mgv"] = "METAL GEAR SURVIVE BETA",
+    ["mhf"] = "Monster Hunter Frontier",
+    ["mhoclient"] = "Monster Hunter Online",
+    ["micromachines"] = "Micro Machines World Series",
+    ["microsimulator"] = "Microtransaction Simulator",
+    ["midair-win64-test"] = "Midair",
+    ["mindnight"] = "MINDNIGHT",
+    ["minecraft"] = "Minecraft",
+    ["minimetro"] = "Mini Metro",
+    ["minionmasters"] = "Minion Masters",
+    ["mirrorlayers"] = "Mirror Layers",
+    ["mirrorsedge"] = "Mirrors Edge",
+    ["mirrorsedgecatalyst"] = "Mirror's Edge: Catalyst",
+    ["miscreated"] = "Miscreated",
+    ["misstake"] = "The Marvellous Miss Take",
+    ["mitosis"] = "Mitos.is: The Game",
+    ["mj"] = "セガNET麻雀MJ",
+    ["mk10"] = "Mortal Kombat 10",
+    ["mkhdgame"] = "Mortal Kombat Arcade Kollection",
+    ["mkke"] = "Mortal Kombat Komplete Edition",
+    ["mn9game"] = "Mighty Number 9",
+    ["mobiusff"] = "MOBIUS FINAL FANTASY",
+    ["moderncombatversus"] = "Modern Combat Versus",
+    ["momodorarutm"] = "Momodora: Reverie Under the Moonlight",
+    ["monaco"] = "Monaco: What's Yours Is Mine",
+    ["monkeyisland101"] = "Tales of Monkey Island",
+    ["monkeyisland102"] = "Tales of Monkey Island",
+    ["monkeyisland103"] = "Tales of Monkey Island",
+    ["monkeyisland104"] = "Tales of Monkey Island",
+    ["monkeyisland105"] = "Tales of Monkey Island",
+    ["monsterhunterworld"] = "MONSTER HUNTER: WORLD",
+    ["monsterprom"] = "Monster Prom",
+    ["moonbasealphagame"] = "Moonbase Alpha",
+    ["moonlighter"] = "Moonlighter",
+    ["morrowind"] = "Morrowind",
+    ["mountain"] = "Mountain",
+    ["mountyourfriends"] = "Mount Your Friends",
+    ["mow_assualt_squad"] = "Men Of War: Assault Squad",
+    ["mowas2"] = "Men Of War: Assault Squad 2",
+    ["mowas_2"] = "Men of War: Assault Squad 2",
+    ["mudrunner"] = "Spintires: MudRunner",
+    ["mugen"] = "M.U.G.E.N",
+    ["mugensouls"] = "Mugen Souls",
+    ["mulegend"] = "MU Legend",
+    ["multi theft auto"] = "Multi Theft Auto San Andreas",
+    ["munin"] = "Munin",
+    ["murder miners"] = "Murder Miners",
+    ["mwoclient"] = "MechWarrior Online",
+    ["mxreflex"] = "MX vs. ATV Reflex",
+    ["mxvsatv"] = "MX vs. ATV Unleashed",
+    ["mycomgames"] = "Warface",
+    ["mysummercar"] = "My Summer Car",
+    ["napoleon"] = "Napoleon: Total War",
+    ["nba2k13"] = "NBA 2k13",
+    ["nba2k14"] = "NBA 2k14",
+    ["nba2k15"] = "NBA 2k15",
+    ["nba2k18"] = "NBA 2K18",
+    ["necrodancer"] = "Crypt of the NecroDancer",
+    ["nekopara_vol0"] = "Nekopara Vol. 0",
+    ["nekopara_vol1"] = "NEKOPARA Vol. 1",
+    ["neoaquarium"] = "NEO AQUARIUM - The King of Crustaceans",
+    ["neoscavenger"] = "NERO Scavenger",
+    ["neptuniarebirth1"] = "Hyperdimension Neptunia Re;Birth1",
+    ["neptuniarebirth2"] = "Hyperdimension Neptunia Re;Birth2",
+    ["neptuniarebirth3"] = "Hyperdimension Neptunia Re;Birth3",
+    ["neverwinter"] = "Neverwinter",
+    ["newcolossus_x64vk"] = "Wolfenstein II: The New Colossus",
+    ["nextday_game"] = "Next Day: Survival",
+    ["nexus"] = "Nexus: The Jupiter Incident",
+    ["nfs11"] = "Need for Speed: Hot Pursuit",
+    ["nfs13"] = "Need For Speed Most Wanted 2012",
+    ["nfs14"] = "Need For Speed: Rivals",
+    ["nfs14_x86"] = "Need For Speed: Rivals",
+    ["nfs16"] = "Need For Speed 2016",
+    ["nfsc"] = "Need for Speed: Carbon",
+    ["nicole"] = "Nicole (Otome Version)",
+    ["nidhogg"] = "Nidhogg",
+    ["nierautomata"] = "NieR:Automata",
+    ["night in the woods"] = "Night in the Woods",
+    ["nino2"] = "Ni no Kuni™ II: Revenant Kingdom",
+    ["nitronicrush"] = "Nitronic Rush",
+    ["nms"] = "No Man's Sky",
+    ["nomad"] = "Nomad",
+    ["northgard"] = "Northgard",
+    ["novaro"] = "Nova Ragnarok Online",
+    ["nrzgame"] = "Yaiba - Ninja Gaiden Z",
+    ["ns2"] = "Natural Selection 2",
+    ["ns3fb"] = "Naruto Shippuden Ultimate Ninja Storm 3 Full Burst",
+    ["nsuns4"] = "NARUTO SHIPPUDEN: Ultimate Ninja STORM 4",
+    ["nsunsr"] = "Naruto Shippuden Ultimate Ninja Storm Revolution",
+    ["nuclearthrone"] = "Nuclear Throne",
+    ["nvse_loader"] = "Fallout: New Vegas",
+    ["nw"] = "Montaro",
+    ["nwmain"] = "Neverwinter Nights",
+    ["nxsteam"] = "Vindictus",
+    ["obduction-win64-shipping"] = "Obduction",
+    ["oblivion"] = "The Elder Scrolls 4: Oblivion",
+    ["observer-win64-shipping"] = "Pneuma: Breath of Life",
+    ["octodaddadliestcatch"] = "Octodad: Deadliest Catch",
+    ["oforcsandmen_steam"] = "Of Orcs and Men",
+    ["ogat"] = "Of Guards And Thieves",
+    ["okami"] = "OKAMI HD / 大神 絶景版",
+    ["olgame"] = "Outlast",
+    ["olliolli2"] = "OlliOlli2",
+    ["omdo"] = "OMDO",
+    ["omensight"] = "Omensight",
+    ["once_human"] = "Once Human",
+    ["one finger death punch"] = "One Finger Death Punch",
+    ["oneshot"] = "OneShot",
+    ["onward"] = "Onward",
+    ["opencodecs_0.85.17777"] = "FaceRig",
+    ["openitg-pc"] = "In The Groove 2",
+    ["openrct2"] = "Rollercoaster Tycoon 2",
+    ["oppw3"] = "One Piece Pirate Warriors 3",
+    ["opus rocket of whispers"] = "OPUS: Rocket of Whispers",
+    ["orcsmustdie2"] = "Orcs Must Die! 2",
+    ["order of battle - pacific"] = "Order of Battle: Pacific",
+    ["organtrail"] = "Organ Trail",
+    ["ori"] = "Ori and the Blind Forest",
+    ["oride"] = "Ori and the Blind Forest: Definitive Edition",
+    ["orion"] = "Guardians of ORION",
+    ["orionclient-win64-shipping"] = "Paragon",
+    ["orlando"] = "Dangerous Golf",
+    ["orwell"] = "Orwell",
+    ["osbuddy"] = "RuneScape",
+    ["osirisnewdawn"] = "Osiris: New Dawn",
+    ["osu!"] = "osu!",
+    ["otherlandsclient-win64-shipping"] = "Rend",
+    ["outlast2"] = "Outlast 2",
+    ["overcooked"] = "Overcooked",
+    ["overcooked2"] = "Overcooked! 2",
+    ["overgrowth"] = "Overgrowth",
+    ["overwatch"] = "Overwatch",
+    ["owlboy"] = "Owlboy",
+    ["oxygennotincluded"] = "Oxygen Not Included",
+    ["pa"] = "Planetary Annihilation",
+    ["paintball war"] = "Paintball War",
+    ["paintthetownred"] = "Paint the Town Red",
+    ["paladins"] = "Paladins",
+    ["pandora"] = "Pandora: Eclipse of Nashira",
+    ["pang"] = "Pang Adventures",
+    ["papersplease"] = "Papers, Please",
+    ["paradiseisland"] = "Paradise Island",
+    ["passpartout"] = "Passpartout: The Starving Artist",
+    ["pathofexile"] = "Path of Exile",
+    ["pathofexile2"] = "Path of Exile 2",
+    ["pathofexile_x64steam"] = "Path of Exile",
+    ["pathofexilesteam"] = "Path of Exile",
+    ["patriots"] = "Rise of Nations: Extended Edition",
+    ["pavlov-win64-shipping"] = "Pavlov VR",
+    ["payday2_win32_release"] = "PAYDAY 2",
+    ["payday_win32_release"] = "PAYDAY: The Heist",
+    ["pbbg_win32"] = "Phantom Break: Baggle Grounds",
+    ["pcars"] = "Project Cars",
+    ["pcars2avx"] = "Project CARS 2",
+    ["pcars64"] = "Project CARS",
+    ["pcbs"] = "PC Building Simulator",
+    ["pcsx2-r5875"] = "PCSX2",
+    ["pctomb5"] = "Tomb Raider: Chronicles",
+    ["pd"] = "Pixel Dungeon",
+    ["perpetuum"] = "Perpetuum Online",
+    ["phase_shift"] = "Phase Shift",
+    ["pickcrafter"] = "PickCrafter",
+    ["pillarsofeternity"] = "Pillars of Eternity",
+    ["pillarsofeternityii"] = "Pillars of Eternity II: Deadfire",
+    ["pinball"] = "3D Pinball: Space Cadet",
+    ["pirate"] = "Pirate101",
+    ["pitpeople"] = "Pit People",
+    ["pixark"] = "PixARK",
+    ["pixel heroes - byte and magic"] = "Pixel Heroes: Byte & Magic",
+    ["pixel_dungeons"] = "Pixel Dungeon",
+    ["pixelworlds"] = "Pixel Worlds",
+    ["pizzeria simulator"] = "Freddy Fazbear's Pizzeria Simulator",
+    ["plagueincevolved"] = "Plague Inc: Evolved",
+    ["plagueincsc"] = "Plague Inc: Evolved",
+    ["planetcoaster"] = "Planet Coaster",
+    ["planetnomads"] = "Planet Nomads",
+    ["planetside2_x64"] = "Planetside 2",
+    ["planetside2_x86"] = "Planetside 2",
+    ["plantsvszombies"] = "Plants vs. Zombies",
+    ["playbns"] = "Blade & Soul",
+    ["playjcmp"] = "Just Cause™ 3: Multiplayer Mod",
+    ["playsnow"] = "SNOW",
+    ["please"] = "Papers",
+    ["pneuma breath of life"] = "Pneuma: Breath of Life",
+    ["pokemon trading card game online"] = "Pokémon Trading Card Game Online",
+    ["pokemoninsurgence"] = "Pokemon Insurgence",
+    ["pokemonshowdown"] = "Pokemon Showdown",
+    ["pokernight2"] = "Poker Night 2",
+    ["pol"] = "FINAL FANTASY XI",
+    ["police"] = "This is the Police",
+    ["police2"] = "This Is the Police 2",
+    ["polybridge"] = "Poly Bridge",
+    ["polynomial"] = "The Polynomial",
+    ["poolians"] = "Real Pool 3D - Poolians",
+    ["popcapgame1"] = "Plants Vs Zombies",
+    ["portal2"] = "Portal 2",
+    ["portal_knights_x64"] = "Portal Knights",
+    ["portalwars-win64-shipping"] = "Splitgate: Arena Warfare",
+    ["portia"] = "My Time At Portia",
+    ["postal2"] = "POSTAL 2",
+    ["postscriptum"] = "Post Scriptum",
+    ["powder"] = "The Powder Toy",
+    ["precisionx_x64"] = "EVGA Precision XOC",
+    ["prey"] = "Prey",
+    ["primalcarnagegame"] = "Primal Cargnage",
+    ["princeofpersia"] = "Prince of Persia: Warrior Within",
+    ["prison architect"] = "Prison Architect",
+    ["prison architect safe mode"] = "Prison Architect",
+    ["pro64_93_3"] = "Pokemon Revolution Online",
+    ["prog"] = "Death Road to Canada",
+    ["project_druid_retail_update"] = "Project Druid",
+    ["project_rhombus"] = "Project Rhombus",
+    ["projectg"] = "PangYa!",
+    ["projectzomboid32"] = "Project Zomboid",
+    ["projectzomboid64"] = "Project Zomboid",
+    ["prominence-win64-shipping"] = "Prominence Poker",
+    ["propwitchhuntmodule-win64-shipping"] = "Witch It",
+    ["proteus"] = "Mega Man Legacy Collection",
+    ["protog"] = "Proto-G",
+    ["protog_preproduction"] = "Proto-G",
+    ["prototypef"] = "Prototype",
+    ["pso"] = "Phantasy Star Online",
+    ["pso2"] = "PHANTASY STAR ONLINE 2",
+    ["psobb"] = "Phantasy Star Online Blue Burst",
+    ["psychonauts"] = "Psychonauts",
+    ["punch club"] = "Punch Club",
+    ["puyovs"] = "Puyo Puyo VS 2",
+    ["pyre"] = "Pyre",
+    ["q2rtx"] = "Quake II",
+    ["quake"] = "Quake",
+    ["quake1"] = "Quake I",
+    ["quake2"] = "Quake II",
+    ["quake3"] = "Quake III",
+    ["quake4"] = "Quake IV",
+    ["quakechampions"] = "Quake Champions",
+    ["quakelive"] = "Quake Live",
+    ["quakelive_steam"] = "Quake Live",
+    ["quantumbreak"] = "Quantum Break",
+    ["qubegame"] = "QUBE",
+    ["questviewer"] = "Audiosurf",
+    ["r6vegas2_game"] = "Tom Clancy's Rainbow Six Vegas II",
+    ["r6vegas_game"] = "Tom Clancy's Rainbow Six Vegas",
+    ["ra3"] = "Command and Conquer: Red Alert 3",
+    ["ra3ep1"] = "Command and Conquer: Red Alert 3",
+    ["rabbit"] = "The Night of the Rabbit",
+    ["raceabit"] = "Race.a.bit",
+    ["racethesun"] = "Race The Sun",
+    ["rad-win64-shipping"] = "Rad Rodgers",
+    ["radicalheights"] = "Radical Heights",
+    ["raft"] = "Raft",
+    ["rage"] = "RAGE",
+    ["rage64"] = "RAGE",
+    ["ragexe"] = "Ragnarok Zero",
+    ["railroads"] = "Sid Meier's Railroads!",
+    ["railworks"] = "Train Simulator",
+    ["rainbowsix"] = "Tom Clancy's Rainbow Six Siege",
+    ["rainbowsix_be"] = "Tom Clancy's Rainbow Six Siege",
+    ["rainslick3"] = "Penny Arcade's On the Rain-Slick Precipice of Darkness 3",
+    ["rainslick4"] = "Penny Arcade's On the Rain-Slick Precipice of Darkness 4",
+    ["rampage_knights"] = "Rampage Knights",
+    ["rats"] = "Bad Rats",
+    ["ravenfield"] = "Ravenfield",
+    ["ravenshield"] = "Tom Clancy's Rainbow Six 3",
+    ["rayman legends"] = "Rayman Legends",
+    ["rayman origins"] = "Rayman Origins",
+    ["rayman2"] = "Rayman 2: The Great Escape",
+    ["rct"] = "RollerCoaster Tycoon: Deluxe",
+    ["rct2"] = "RollerCoaster Tycoon 2: Triple Thrill Pack",
+    ["rct3plus"] = "RollerCoaster Tycoon 3: Platinum!",
+    ["re5dx9"] = "Resident Evil 5 / Biohazard 5",
+    ["re6"] = "Resident Evil 6",
+    ["re7"] = "RESIDENT EVIL 7 biohazard / BIOHAZARD 7 resident evil",
+    ["reactivedrop"] = "Alien Swarm: Reactive Drop",
+    ["realliveen"] = "CLANNAD",
+    ["realm of the mad god"] = "Realm of the Mad God",
+    ["realmeac"] = "Realm Royale",
+    ["realmgrinderdesktop"] = "Realm Grinder",
+    ["reassemblyrelease"] = "Reassembly",
+    ["rebelgalaxy"] = "Rebel Galaxy",
+    ["rebelgalaxygog"] = "Rebel Galaxy",
+    ["rebelgalaxysteam"] = "Rebel Galaxy",
+    ["reckoning"] = "Kingdoms of Amalur: Reckoning",
+    ["recroom_release"] = "Rec Room",
+    ["red crucible"] = "Red Crucible: Firestorm",
+    ["redfaction"] = "Red Faction",
+    ["redout"] = "Redout",
+    ["redout-win64-shipping"] = "Redout",
+    ["redtrigger"] = "Red Trigger",
+    ["reflex"] = "Reflex",
+    ["reigns"] = "Reigns",
+    ["reliccoh"] = "Company of Heroes",
+    ["reliccoh2"] = "Company of Heroes 2",
+    ["relicdow3"] = "Warhammer 40,000: Dawn of War 3",
+    ["relichunterszero"] = "Relic Hunters Zero",
+    ["rememberinghowwemet"] = "A Kiss For The Petals - Remembering How We Met",
+    ["rememberme"] = "Remember Me",
+    ["removesaves"] = "Mafia II",
+    ["reprisaluniverse"] = "Reprisal Universe",
+    ["rerev"] = "Resident Evil Revelations",
+    ["rerev2"] = "Resident Evil Revelations 2",
+    ["retrocityrampage"] = "Retro City Rampage",
+    ["reus"] = "Reus",
+    ["rf4_x64"] = "Russian Fishing 4",
+    ["rfactor"] = "rFactor",
+    ["rfactor2"] = "rFactor 2",
+    ["rfg"] = "Red Faction: Guerrilla",
+    ["ride"] = "$1 Ride",
+    ["rift"] = "Rift",
+    ["rift_x64"] = "RiFT",
+    ["rik"] = "ProjectRIK",
+    ["rimworld914win"] = "RimWorld",
+    ["rimworldwin"] = "RimWorld",
+    ["ringrunner"] = "Ring Runner",
+    ["risen"] = "Risen",
+    ["risen3"] = "Risen 3 - Titan Lords",
+    ["risingstorm2"] = "Rising Storm 2",
+    ["risk of rain"] = "Risk of Rain",
+    ["rivalsofaether"] = "Rivals of Aether",
+    ["rivergame-win64-shipping"] = "The Flame in the Flood",
+    ["rks"] = "Rosenkreuzstilette Grollschwert",
+    ["rks_e"] = "Rosenkreuzstilette Grollschwert",
+    ["roa2-win64-shipping"] = "Rock of Ages 2",
+    ["roblox"] = "ROBLOX",
+    ["robloxplayerbeta"] = "Roblox",
+    ["robloxstudiobeta"] = "Roblox Studio",
+    ["robocraft"] = "Robocraft",
+    ["robocraftclient"] = "Robocraft",
+    ["rocketleague"] = "Rocket League",
+    ["rockfest"] = "Rockfest",
+    ["rocksmith"] = "Rocksmith",
+    ["rocksmith2014"] = "Rocksmith 2014",
+    ["rogame"] = "Rising Storm/Red Orchestra 2",
+    ["roguelands"] = "Roguelands",
+    ["roguelegacy"] = "Rogue Legacy",
+    ["roguesystemsim"] = "Rogue System",
+    ["rome2"] = "Total War: Rome 2",
+    ["rometw"] = "Rome: Total War",
+    ["ros"] = "Rules Of Survival",
+    ["rotaku"] = "Rotaku Society",
+    ["rott"] = "Rise of the Triad (2013)",
+    ["rottr"] = "Rise of the Tomb Raider",
+    ["rpg_rt"] = "Yume Nikki",
+    ["rpgmv"] = "RPG Maker MV",
+    ["rpgvxace"] = "RPG Maker VX Ace",
+    ["rrre64"] = "RaceRoom Racing Experience",
+    ["ruiner"] = "RUINER",
+    ["ruiner-win64-shipping"] = "RUINER",
+    ["runescape"] = "RuneScape",
+    ["rust"] = "Rust - Staging Branch",
+    ["rustclient"] = "Rust",
+    ["rwby-ge"] = "RWBY: Grimm Eclipse",
+    ["rwr_game"] = "RUNNING WITH RIFLES",
+    ["rxgame-win64-shipping"] = "Gigantic",
+    ["ryse"] = "Ryse: Son of Rome",
+    ["s1_mp64_ship"] = "Call of Duty Advanced Warfare: Multiplayer",
+    ["s1_sp64_ship"] = "Call of Duty Advanced Warfare",
+    ["s2_mp64_ship"] = "Call of Duty: WWII",
+    ["s2_sp64_ship"] = "Call of Duty®: WWII",
+    ["s4client"] = "S4 League",
+    ["sacred2"] = "Sacred 2 Gold",
+    ["sacred3"] = "Sacred 3",
+    ["safetyfirst"] = "Safety First!",
+    ["saintsrowgatoutofhell"] = "Saints Row: Gat out of Hell",
+    ["saintsrowiv"] = "Saints Row IV",
+    ["saintsrowthethird"] = "Saints Row 3",
+    ["saintsrowthethird_dx11"] = "Saints Row 3",
+    ["salt"] = "Salt and Sanctuary",
+    ["sam3"] = "Serious Sam 3: BFE",
+    ["sanctumgame-win32-shipping"] = "Sanctum 2",
+    ["saofb-win64-shipping"] = "Sword Art Online: Fatal Bullet",
+    ["sas4-win"] = "SAS: Zombie Assault 4",
+    ["satellitereignwindows"] = "Satellite Reign",
+    ["satinav"] = "The Dark Eye: Chains of Satinav",
+    ["sausage"] = "Stephen's Sausage Roll",
+    ["sbs"] = "Slam Bolt Scrappers",
+    ["sc2"] = "Starcraft II",
+    ["sc2_x64"] = "StarCraft II",
+    ["sc2vn"] = "SC2VN: The e-sport Visual Novel",
+    ["scpsl"] = "SCP: Secret Laboratory",
+    ["scrapmechanic"] = "Scrap Mechanic",
+    ["screencheat"] = "Screencheat",
+    ["scribble"] = "Scribblenauts Unmasked: A DC Comics Adventure",
+    ["scum"] = "SCUM",
+    ["sdhdship"] = "Sleeping Dogs: Definitive Edition",
+    ["se4"] = "Space Empires IV",
+    ["seagame"] = "Steel Ocean",
+    ["secondlifeviewer"] = "Second Life",
+    ["secretponchosd3d11"] = "Secret Ponchos",
+    ["secrets of grindea"] = "Secrets of Grindea",
+    ["segagameroom"] = "SEGA Mega Drive & Genesis Classics",
+    ["seum"] = "SEUM: Speedrunners from Hell",
+    ["sf3clientfinal"] = "SpellForce 3",
+    ["sfm"] = "Source Filmmaker",
+    ["sftk"] = "Street Fighter X Tekken",
+    ["sgw3"] = "Sniper Ghost Warrior 3",
+    ["sh-win64-shipping"] = "Desolate",
+    ["sh3"] = "Silent Hunter 3",
+    ["sh4"] = "Silent Hunter: Wolves of the Pacific",
+    ["sh5"] = "Silent Hunter 5: Battle of the Atlantic",
+    ["shadow tactics"] = "Shadow Tactics: Blades of the Shogun",
+    ["shadowcomplex-win32"] = "Shadow Complex",
+    ["shadowcomplex-win32-egl"] = "Shadow Complex",
+    ["shadowgrounds"] = "Shadowgrounds",
+    ["shadowofmordor"] = "Shadow Of Mordor",
+    ["shadowofwar"] = "Middle-earth: Shadow of War",
+    ["shadowrun"] = "Shadowrun Returns",
+    ["shadowverse"] = "Shadowverse",
+    ["shadowwarrior2"] = "Shadow Warrior 2",
+    ["shakes and fidget"] = "Shakes and Fidget",
+    ["shank"] = "Shank",
+    ["shank2"] = "Shank 2",
+    ["shantaecurse"] = "Shantae and the Pirate's Curse",
+    ["shatteredplanet"] = "Shattered Planet",
+    ["shatteredskies"] = "Shattered Skies",
+    ["she4"] = "Silent Hunter 4: Wolves of the Pacific",
+    ["shellshocklive"] = "ShellShock Live",
+    ["shiny"] = "Shiny The Firefly",
+    ["shipping-thiefgame"] = "Thief",
+    ["shippingpc-afeargame"] = "Alien Rage",
+    ["shippingpc-bmgame"] = "Batman Arkham Asylum",
+    ["shippingpc-stormgame"] = "Bulletstorm",
+    ["shock2"] = "System Shock 2",
+    ["shogun2"] = "Total War: SHOGUN 2",
+    ["shootergame"] = "Ark: Survival Evolved",
+    ["shootergame-win32-shipping"] = "Dirty Bomb",
+    ["shootergame_be"] = "ARK: Survival Of The Fittest",
+    ["shooterultimate"] = "PixelJunk Shooter Ultimate",
+    ["shootingstars"] = "Shooting Stars!",
+    ["shootyskies"] = "Shooty Skies",
+    ["shovelknight"] = "Shovel Knight",
+    ["showerdad"] = "Shower With Your Dad Simulator 2015: Do You Still Shower With Your Dad",
+    ["shroud of the avatar"] = "Shroud of the Avatar",
+    ["shutupndigsteamm5"] = "Shut Up And Dig",
+    ["silence"] = "Silence",
+    ["simcity"] = "SimCity™",
+    ["simcity 4"] = "SimCity 4 Deluxe",
+    ["simpleplanes"] = "SimplePlanes",
+    ["simpsons"] = "The Simpsons: Hit & Run",
+    ["sims2ep9"] = "The Sims 2: Ultimate Collection",
+    ["sinemora"] = "Sine-Mora",
+    ["sinemoraex"] = "Sine Mora EX",
+    ["sins of a solar empire rebellion"] = "Sins of a Solar Empire: Rebellion",
+    ["sir"] = "Sir You Are Being Hunted",
+    ["sisterlocation"] = "Five Nights at Freddy's: Sister Location",
+    ["sifu-win64-shipping"] = "Sifu",
+    ["skilltree"] = "Skilltree Saga",
+    ["skullgirls"] = "Skullgirls",
+    ["skydrift"] = "Gensou SkyDrift",
+    ["skyforge"] = "Skyforge",
+    ["slap city"] = "Slap City",
+    ["slaythespire"] = "Slay the Spire",
+    ["slime-san"] = "Slime-san",
+    ["slimerancher"] = "Slime Rancher",
+    ["slw"] = "Sonic Lost World",
+    ["smite"] = "Smite",
+    ["smiteeac"] = "SMITE",
+    ["sniper_x86"] = "Sniper: Ghost Warrior",
+    ["sniperelite4"] = "Sniper Elite 4",
+    ["sniperelitev2"] = "Sniper Elite V2",
+    ["sniperghostwarrior2"] = "Sniper Ghost Warrior 2",
+    ["soma"] = "Soma",
+    ["sonic2app"] = "Sonic Adventure 2",
+    ["sonic_vis"] = "Sonic the Hedgehog 4 EP 1",
+    ["sonic_xp"] = "Sonic the Hedgehog 4 EP 1",
+    ["sonicgenerations"] = "Sonic Generations",
+    ["sonicmania"] = "Sonic Mania",
+    ["sorts2"] = "Sword of the Stars II: Lords of Winter",
+    ["sos-win64-shipping"] = "SOS",
+    ["soulaxiom"] = "Soul Axiom",
+    ["soulcraft"] = "SoulCraft",
+    ["soulstorm"] = "Warhammer 40K: Dawn of War SoulSorm",
+    ["soulworker"] = "SoulWorker",
+    ["soulworker100"] = "Soul Worker Online",
+    ["south park - the stick of truth"] = "South Park The Stick of Truth",
+    ["southpark_tfbw"] = "South Park Fractured But Whole",
+    ["spaceengineers"] = "Space Engineers",
+    ["spacegame-win64-shipping"] = "Fractured Space",
+    ["spacehulkgame-win64-shipping"] = "Space Hulk: Deathwing - Enhanced Edition",
+    ["spazgame"] = "Space Pirates and Zombies",
+    ["specopstheline"] = "Spec Ops: The Line",
+    ["speed"] = "Need For Speed Most Wanted",
+    ["speedrunners"] = "SpeedRunners",
+    ["spellforce"] = "SpellForce: Platinum Edition",
+    ["spellforce2"] = "SpellForce 2 - Anniversary Edition",
+    ["spellsworn-win64-test"] = "Spellsworn",
+    ["spelunky"] = "Spelunky",
+    ["sphinxd_gl"] = "Sphinx and the Cursed Mummy",
+    ["spintires"] = "Spintires",
+    ["spitfiredashboard"] = "Orcs Must Die! Unchained",
+    ["spitfiregame"] = "Orcs Must Die! Unchained",
+    ["splintercell"] = "Tom Clancy's Splinter Cell",
+    ["splintercell3"] = "Tom Clancy's Splinter Cell Chaos Theory",
+    ["splitsecond"] = "Split/Second",
+    ["spooky"] = "Spooky's Jump Scare Mansion",
+    ["sporeapp"] = "Spore",
+    ["spyparty"] = "Spy Party",
+    ["squad22"] = "Meridian: Squad 22",
+    ["sr2_pc"] = "Saints Row 2",
+    ["srhk"] = "Shadowrun: Hong Kong",
+    ["ss2013"] = "Surgeon Simulator",
+    ["ssf2"] = "Super Smash Flash 2",
+    ["ssfexe"] = "Super Smash Flash 1",
+    ["ssfiv"] = "Ultra Street Fighter IV",
+    ["sshock"] = "System Shock: Enhanced Edition",
+    ["sspace"] = "Shaddow Space",
+    ["stalker-cop"] = "S.T.A.L.K.E.R.: Call of Pripyat",
+    ["stalker2-win64-shipping"] = "S.T.A.L.K.E.R. 2",
+    ["stanley"] = "The Stanley Parable",
+    ["star trek online"] = "Star Trek Online",
+    ["star_trek_online"] = "Star Trek Online",
+    ["starbound"] = "Starbound",
+    ["starbound_opengl"] = "Starbound",
+    ["starcitizen"] = "Star Citizen",
+    ["starcraft"] = "StarCraft",
+    ["starcraft ii"] = "Starcraft II",
+    ["starcraft ii editor_x64"] = "Starcraft II Editor",
+    ["stardew valley"] = "Stardew Valley",
+    ["stardrive"] = "Star Drive",
+    ["starwarsbattlefront"] = "STAR WARS Battlefront",
+    ["starwarsg"] = "STAR WARS™ Empire at War: Gold Pack",
+    ["stateofdecay"] = "State of Decay: Year-One",
+    ["steeldivision"] = "Steel Division: Normandy 44",
+    ["steinsgate"] = "STEINS;GATE",
+    ["stellarimpact"] = "Stellar Impact",
+    ["stellaris"] = "Stellaris",
+    ["stepmania"] = "Step Mania",
+    ["stepmania-sse2"] = "StepMania",
+    ["stickfight"] = "Stick Fight: The Game",
+    ["stonehearth"] = "Stonehearth",
+    ["stoneshard"] = "Stoneshard: Prologue",
+    ["stories"] = "Stories: The Path of Destinies",
+    ["stranded_deep_x64"] = "Stranded Deep",
+    ["streetfighteriv"] = "Street Fighter IV",
+    ["streetfighterv"] = "Street Fighter V",
+    ["streetfightervbeta-win64-shipping"] = "Street Fighter V",
+    ["streetsofrogue"] = "Streets of Rogue",
+    ["strife"] = "Strife",
+    ["strife-ve"] = "Strife: Veteran Edition",
+    ["strikersedge"] = "Striker's Edge",
+    ["stronghold crusader"] = "Stronghold Crusader HD",
+    ["styx2"] = "Styx: Shards of Darkness",
+    ["styx2-win64-shipping"] = "Styx: Shards of Darkness",
+    ["styxgame"] = "Styx: Master of Shadows",
+    ["sublevelzero"] = "Sublevel Zero",
+    ["submerge-win64-shipping"] = "Subsiege",
+    ["subnautica"] = "Subnautica",
+    ["sudeki"] = "Sudeki",
+    ["summercamp"] = "Friday the 13th: The Game",
+    ["sundered"] = "Sundered",
+    ["sunless skies"] = "Sunless Skies",
+    ["super treasure arena"] = "Super Treasure Arena",
+    ["superdungeonbros"] = "Super Dungeon Bros",
+    ["superflight"] = "Superflight",
+    ["superhexagon"] = "Super Hexagon",
+    ["superhot"] = "Superhot",
+    ["superhotvr"] = "SUPERHOT VR",
+    ["supermeatboy"] = "Super Meat Boy",
+    ["supermncgameclient"] = "Super Monday Night Combat",
+    ["supremecommander"] = "Supreme Commander: Forged Alliance",
+    ["supremecommander2"] = "Supreme Commander 2",
+    ["survivor"] = "Shadowgrounds: Survivor",
+    ["svencoop"] = "Sven Co-op",
+    ["sw.x64"] = "Shadow Warrior",
+    ["swarm"] = "Alien Swarm",
+    ["sweaw"] = "Star Wars: Empire at War",
+    ["swiftkit-rs"] = "RuneScape",
+    ["swkotor"] = "STAR WARS™: Knights of the Old Republic™",
+    ["swkotor2"] = "STAR WARS™ Knights of the Old Republic™ II: The Sith Lords™",
+    ["swordandsworcery_pc"] = "Superbrothers: Sword & Sworcery EP",
+    ["swordcoast"] = "Sword Coast Legends",
+    ["swordwithsauce-win64-shipping"] = "Sword With Sauce: Alpha",
+    ["swrepubliccommando"] = "STAR WARS™ Republic Commando",
+    ["swtor"] = "STAR WARS: The Old Republic",
+    ["syndicate"] = "Syndicate",
+    ["synergy"] = "Synergy",
+    ["system shock2"] = "System Shock 2",
+    ["system40"] = "Sengoku Rance",
+    ["t-engine"] = "Tales of Maj'Eyal",
+    ["t6sp"] = "Call of Duty: Black Ops",
+    ["t6zm"] = "Call of Duty: Black Ops II",
+    ["tabletop simulator"] = "Tabletop Simulator",
+    ["tachyon"] = "Tachyon: The Fringe",
+    ["tactical monsters"] = "Tactical Monsters Rumble Arena",
+    ["tales of berseria"] = "Tales of Berseria",
+    ["tales of zesteria"] = "Tales of Zestiria",
+    ["talisman"] = "Talisman: Digital Edition",
+    ["talos"] = "The Talos Principle",
+    ["tane"] = "Trainz: A New Era",
+    ["tbl-win64-shipping"] = "Mirage: Arcane Warfare",
+    ["teeworlds"] = "Teeworlds",
+    ["tekkengame-win64-shipping"] = "TEKKEN 7",
+    ["tera"] = "TERA",
+    ["terraria"] = "Terraria",
+    ["terratechwin32"] = "TerraTech",
+    ["terratechwin64"] = "TerraTech",
+    ["tesv"] = "The Elder Scrolls V: Skyrim",
+    ["tesv_original"] = "The Elder Scrolls V: Skyrim",
+    ["tetris"] = "Tetris",
+    ["tew2"] = "The Evil Within 2",
+    ["th06"] = "Touhou 6: Embodiment of Scarlet Devil",
+    ["th06e"] = "Touhou 6: Embodiment of Scarlet Devil",
+    ["th07"] = "Touhou 7: Perfect Cherry Blossom",
+    ["th075"] = "Touhou 7.5: Immaterial and Missing Power",
+    ["th075e"] = "Touhou 7.5: Immaterial and Missing Power",
+    ["th07e"] = "Touhou 7: Perfect Cherry Blossom",
+    ["th08"] = "Touhou 8: Imperishable Night",
+    ["th08e"] = "Touhou 8: Imperishable Night",
+    ["th09"] = "Touhou 9: Phantasmagoria Of Flower View",
+    ["th095"] = "Touhou 9.5: Shoot the Bullet",
+    ["th095e"] = "Touhou 9.5: Shoot the Bullet",
+    ["th09e"] = "Touhou 9: Phantasmagoria Of Flower View",
+    ["th10"] = "Touhou 10: Mountain of Faith",
+    ["th105"] = "Touhou 10.5: Scarlet Weather Rhapsody",
+    ["th105e"] = "Touhou 10.5: Scarlet Weather Rhapsody",
+    ["th10e"] = "Touhou 10: Mountain of Faith",
+    ["th11"] = "Touhou 11: Subterranean Animism",
+    ["th11e"] = "Touhou 11: Subterranean Animism",
+    ["th12"] = "Touhou 12: Undefined Fantastic Object",
+    ["th123"] = "Touhou 12.3: Hisoutensoku",
+    ["th123e"] = "Touhou 12.3: Hisoutensoku",
+    ["th125"] = "Touhou 12.5: Double Spoiler",
+    ["th125e"] = "Touhou 12.5: Double Spoiler",
+    ["th128"] = "Touhou 12.8: Great Fairy Wars",
+    ["th128e"] = "Touhou 12.8: Great Fairy Wars",
+    ["th12e"] = "Touhou 12: Undefined Fantastic Object",
+    ["th13"] = "Touhou 13: Ten Desires",
+    ["th135"] = "Touhou 13.5 Hopeless Mascarade",
+    ["th135e"] = "Touhou 13.5 Hopeless Mascarade",
+    ["th13e"] = "Touhou 13: Ten Desires",
+    ["th14"] = "Touhou 14: Double Dealing Character",
+    ["th143"] = "Touhou 14.3: Impossible Spell Card",
+    ["th143e"] = "Touhou 14.3: Impossible Spell Card",
+    ["th145"] = "Touhou 14.5: Urban Legend in Limbo",
+    ["th145e"] = "Touhou 14.5: Urban Legend in Limbo",
+    ["th14e"] = "Touhou 14: Double Dealing Character",
+    ["th15"] = "Touhou 15: Legacy of Lunatic Kingdom",
+    ["th15e"] = "Touhou 15: Legacy of Lunatic Kingdom",
+    ["the banner saga"] = "The Banner Saga",
+    ["the banner saga 2"] = "The Banner Saga 2",
+    ["the banner saga 3"] = "Banner Saga 3",
+    ["the dig"] = "The Dig",
+    ["the elder scrolls legends"] = "The Elder Scrolls: Legends",
+    ["the jackbox party pack 2"] = "The Jackbox Party Pack 2",
+    ["the jackbox party pack 3"] = "The Jackbox Party Pack 3",
+    ["the jackbox party pack 4"] = "The Jackbox Party Pack 4",
+    ["the universim"] = "The Universim",
+    ["thebaconing"] = "The Baconing",
+    ["thebureau"] = "The Bureau: XCOM Declassified",
+    ["thecrew"] = "The Crew",
+    ["thecrew2"] = "The Crew 2 - Open Beta",
+    ["thedivision"] = "Tom Clancy's The Division",
+    ["thedivision2"] = "The Division 2",
+    ["theescapists"] = "The Escapists",
+    ["theescapists2"] = "The Escapists 2",
+    ["theexit-win64-shipping"] = "DEATHGARDEN",
+    ["theforest"] = "The Forest",
+    ["thegreatcircle"] = "Indiana Jones and the Great Circle",
+    ["thehuntercotw_f"] = "theHunter™: Call of the Wild",
+    ["theinnerworld"] = "The Inner World",
+    ["thelab"] = "The Lab",
+    ["themod 1.3"] = "Tony Hawk's Underground 2",
+    ["thenewz"] = "Infestation: The New Z",
+    ["thepark"] = "The Park",
+    ["therewasacaveman"] = "There Was A Caveman",
+    ["thesecretworld"] = "The Secret World",
+    ["thesecretworlddx11"] = "The Secret World",
+    ["thespacegame"] = "Ascent - The Space Game",
+    ["thesurge"] = "The Surge",
+    ["thewalkingdead2"] = "The Walking Dead Season Two",
+    ["thewolfamongus"] = "The Wolf Among Us",
+    ["theyarebillions"] = "They Are Billions",
+    ["thg_demo_3"] = "Titanic: Honor and Glory",
+    ["think of the children beta"] = "Think of the Children",
+    ["this war of mine"] = "This War of Mine",
+    ["thmhj"] = "Fantastic Danmaku Festival",
+    ["throneoflies"] = "Throne of Lies",
+    ["thrones"] = "Total War Saga: Thrones of Britannia",
+    ["thug"] = "Tony Hawk's Underground",
+    ["thug2"] = "Tony Hawk's Underground 2",
+    ["thugpro"] = "THUG Pro",
+    ["tibia"] = "Tibia",
+    ["timeclickers"] = "Time Clickers",
+    ["tinybrains"] = "Tiny Brains",
+    ["tis100"] = "TIS-100",
+    ["titan"] = "Titan Souls",
+    ["titanfall"] = "Titanfall",
+    ["titanfall2"] = "Titanfall 2",
+    ["tjpp"] = "The Jackbox Party Pack",
+    ["tkom"] = "Take On Mars",
+    ["tld"] = "The Long Dark",
+    ["tljh-win64-shipping"] = "The Long Journey Home",
+    ["tlr"] = "The Last Remnant",
+    ["tmforever"] = "Trackmania United Forever",
+    ["tmnt-oots"] = "Teenage Mutant Ninja Turtles: Out of Shadows",
+    ["tmunitedforever"] = "Trackmania United Forever",
+    ["to the moon"] = "To the Moon",
+    ["tomb2"] = "Tomb Raider II",
+    ["tomb3"] = "Tomb Raider III: Adventures of Lara Croft",
+    ["tomb4"] = "Tomb Raider: The Last Revelation",
+    ["tombraider"] = "Tomb Raider",
+    ["toothandtail"] = "Tooth and Tail",
+    ["torchlight"] = "Torchlight",
+    ["torchlight2"] = "Torchlight II",
+    ["toren"] = "Toren",
+    ["toribash"] = "Toribash",
+    ["torment"] = "Planescape: Torment",
+    ["tormentorxpunisher"] = "Tormentor❌Punisher",
+    ["totallyaccuratebattlegrounds"] = "Totally Accurate Battlegrounds",
+    ["tower"] = "Tower Unite",
+    ["tower-win64-shipping"] = "Tower Unite",
+    ["townofsalem"] = "Town of Salem",
+    ["townsmen"] = "Townsmen",
+    ["toxikk"] = "TOXIKK",
+    ["tph"] = "Two Point Hospital",
+    ["tq"] = "Titan Quest",
+    ["tr"] = "Trench Run",
+    ["tra"] = "Tomb Raider: Anniversary",
+    ["trackmaniaturbo"] = "Trackmania Turbo",
+    ["traktor.amalgam.app"] = "Gear Up",
+    ["transformersdevastation"] = "Transformers: Devastation",
+    ["transformice"] = "Transformice",
+    ["transistor"] = "Transistor",
+    ["transition"] = "WAKFU",
+    ["transportfever"] = "Transport Fever",
+    ["traod_p4"] = "Tomb Raider: Angel of Darkness",
+    ["trappeddeadlockdown"] = "Trapped Dead: Lockdown",
+    ["trgame"] = "Tales Runner",
+    ["triadwars"] = "Triad Wars",
+    ["trials_fusion"] = "Trials Fusion",
+    ["trialsblooddragon"] = "Trials of the Blood Dragon",
+    ["trialsfmx"] = "Trials Evolution",
+    ["tribesascend"] = "Tribes: Ascend",
+    ["trickytowers"] = "Tricky Towers",
+    ["trine"] = "Trine",
+    ["trine1_32bit"] = "Trine Enchanted Edition",
+    ["trine2_32bit"] = "Trine 2",
+    ["trine3_32bit"] = "Trine 3",
+    ["trine3_64bit"] = "Trine 3",
+    ["tripletown"] = "Triple Town",
+    ["tristoy"] = "TRISTOY",
+    ["trl"] = "Tomb Raider: Legend",
+    ["tron"] = "Tron 2.0",
+    ["tropico4"] = "Tropico 4",
+    ["trove"] = "Trove",
+    ["tru"] = "Tomb Raider: Underworld",
+    ["trulon"] = "Trulon: The Shadow Engine",
+    ["ts3"] = "The Sims 3",
+    ["ts3w"] = "The Sims 3",
+    ["ts4"] = "The Sims 4",
+    ["ts4_x64"] = "The Sims 4",
+    ["tsa"] = "Touhou Sky Arena",
+    ["tslgame"] = "Player Unknown's Battlegrounds",
+    ["tslgame_be"] = "PUBG",
+    ["tsunmajo"] = "Tsundertaker's Mahou Removal",
+    ["ttrengine"] = "Toontown Rewritten",
+    ["turmoil_pc_full"] = "Turmoil",
+    ["twinsector_steam"] = "Twin Sector",
+    ["twwse"] = "The Whispered World Special Edition",
+    ["tyranny"] = "Tyranny",
+    ["uagame"] = "Arena Breakout Infinite",
+    ["udk"] = "Unreal Development Kit",
+    ["udkgame"] = "Unmechanical",
+    ["ue4-win64-shipping"] = "Unreal Tournament 4",
+    ["ue4-win64-test"] = "Unreal Tournament 4",
+    ["ue4editor"] = "Unreal Editor",
+    ["ue4game-win64-shipping"] = "<disable>",
+    ["uebs"] = "Ultimate Epic Battle Simulator",
+    ["ultimate custom night"] = "Ultimate Custom Night",
+    ["ultimatechickenhorse"] = "Ultimate Chicken Horse",
+    ["undertale"] = "Undertale",
+    ["undying"] = "Clive Barker's Undying",
+    ["universe sandbox x64"] = "Universe Sandbox ²",
+    ["uno"] = "UNO",
+    ["unreal"] = "Unreal Gold",
+    ["unrealtournament"] = "Unreal Tournament 4",
+    ["unturned_be"] = "Unturned",
+    ["uokr"] = "Ultima Online",
+    ["urbantrialfreestyle"] = "Urban Trial Freestyle",
+    ["ut2004"] = "Unreal Tournament 2004",
+    ["ut3"] = "Unreal Tournament 3",
+    ["uurnog"] = "Uurnog Uurnlimited",
+    ["v2game"] = "Victoria II",
+    ["va-11 hall a"] = "VA-11 Hall-A: Cyberpunk Bartender Action",
+    ["valkyria"] = "Valkyria Chronicles™",
+    ["valley"] = "Valley",
+    ["vampire"] = "Vampire: The Masquerade - Bloodlines",
+    ["vermintide"] = "Warhammer: End Times - Vermintide",
+    ["vermintide2"] = "Warhammer: End Times - Vermintide 2",
+    ["vermintide2_dx12"] = "Warhammer: End Times - Vermintide 2",
+    ["vessel"] = "Vessel",
+    ["vfracer"] = "Mantis Burn Racing",
+    ["victoria2"] = "Victoria II",
+    ["vikingrage"] = "Viking Rage",
+    ["vindictus"] = "Vindictus",
+    ["viridi"] = "Viridi",
+    ["visconfig"] = "Ken Follett's The Pillars of the Earth",
+    ["vngame"] = "Rising Storm 2: Vietnam",
+    ["voxelfarmkit"] = "Voxel Farm",
+    ["vrchat"] = "VRChat",
+    ["vu"] = "Battlefield 3: Venice Unleashed",
+    ["wa"] = "Worms Armageddon",
+    ["walkingdead101"] = "The Walking Dead",
+    ["war"] = "Warhammer Online",
+    ["war-win64-shipping"] = "Foxhole",
+    ["war3"] = "Warcraft III",
+    ["warcraft ii bne"] = "Warcraft 2",
+    ["warcraft iii"] = "Warcraft III",
+    ["warframe.x64"] = "Warframe",
+    ["wargame3"] = "Wargame: Red Dragon",
+    ["warhammer"] = "Warhammer: Total War",
+    ["warhammer2"] = "Total War: WARHAMMER II",
+    ["warmode"] = "WARMODE",
+    ["warrecs"] = "Warrecs",
+    ["warrobots"] = "War Robots",
+    ["warsow_x64"] = "Warsow",
+    ["warsow_x86"] = "Warsow",
+    ["watch_dogs"] = "Watch_Dogs",
+    ["watchdogs2"] = "Watch_Dogs 2",
+    ["wc3"] = "Warcraft 3: Reign of Chaos",
+    ["we were here"] = "We Were Here",
+    ["we were here too"] = "We Were Here Too",
+    ["we were here vr"] = "We Were Here",
+    ["weneedtogodeeper"] = "We Need to Go Deeper",
+    ["wesnoth"] = "Battle for Wesnoth",
+    ["west of loathing"] = "West of Loathing",
+    ["wftogame"] = "War For The Overworld",
+    ["whitesilence-win64-shipping"] = "Fade to Silence",
+    ["whosyourdaddy"] = "Who's Your Daddy",
+    ["wildstar"] = "WildStar",
+    ["wildstar64"] = "WildStar",
+    ["windscape"] = "Windscape",
+    ["wings of vi"] = "Wings of Vi",
+    ["winquake"] = "Quake",
+    ["witcher"] = "The Witcher: Enhanced Edition",
+    ["witcher2"] = "The Witcher 2: Assassins of Kings Enhanced Edition",
+    ["witcher3"] = "The Witcher 3: Wild Hunt",
+    ["witn"] = "The Lord of the Rings: War in the North",
+    ["witness64_d3d11"] = "The Witness",
+    ["wizard101"] = "Wizard101",
+    ["wizardoflegend"] = "Wizard of Legend",
+    ["wl2"] = "Wasteland II",
+    ["wmencoderen"] = "The Guild 2 Renaissance",
+    ["wmv9codec"] = "Bridge Constructor Stunts",
+    ["wolcen"] = "Wolcen: Lords of Mayhem",
+    ["wolfmp"] = "Return to Castle Wolfenstein",
+    ["wolfneworder_x64"] = "Wolfenstein: The New Order",
+    ["wolfoldblood_x64"] = "Wolfenstein: The Old Blood",
+    ["wolfsp"] = "Return to Castle Wolfenstein",
+    ["worldoftanks"] = "World of Tanks",
+    ["worldofwarplanes"] = "World of Warplanes",
+    ["worldofwarships"] = "World of Warships",
+    ["worldsadrift"] = "Worlds Adrift",
+    ["wormis"] = "Worm.is: The Game",
+    ["worms w.m.d"] = "Worms W.M.D",
+    ["wormsrevolution"] = "Worms Revolution",
+    ["wotblitz"] = "World of Tanks Blitz",
+    ["wow"] = "World of Warcraft",
+    ["wow-64"] = "World of Warcraft",
+    ["wowt-64"] = "World of Warcraft Public Test",
+    ["wreckfest"] = "Next Car Game: Wreckfest",
+    ["wreckfest_x64"] = "Wreckfest",
+    ["wulverblade"] = "Wulverblade",
+    ["wuthering waves"] = "Wuthering Waves",
+    ["ww2"] = "World War II Online",
+    ["wwe2k18_x64"] = "WWE 2K18",
+    ["wz2100"] = "Warzone 2100",
+    ["x-plane-32bit"] = "X-Plane",
+    ["x2"] = "Elsword",
+    ["xcom2"] = "XCOM 2",
+    ["xcomew"] = "XCOM: Enemy Unknown",
+    ["xcomew.exe"] = "XCOM Enemy Within",
+    ["xcomgame"] = "XCOM: Enemy Unknown",
+    ["xdefiant"] = "XDefiant",
+    ["xenonracer"] = "Xenon Racer",
+    ["xenonracer-win64-shipping"] = "Xenon Racer",
+    ["xgamefinal"] = "Halo Wars: Definitive Edition",
+    ["xr_3da"] = "S.T.A.L.K.E.R.: Shadow of Chernobyl",
+    ["xrebirth"] = "X Rebirth",
+    ["xrengine"] = "S.T.A.L.K.E.R.: Clear Sky",
+    ["xvid-1.3.2-20110601"] = "Helldorado",
+    ["yakuza0"] = "Yakuza 0",
+    ["yetanotherzombiedefense"] = "Yet Another Zombie Defense",
+    ["ygopro_vs"] = "YGOPRO",
+    ["ylands"] = "Ylands",
+    ["yo_cm_client"] = "Life is Feudal: Your Own",
+    ["youtuberslife"] = "Youtubers Life",
+    ["yugioh"] = "Yu-Gi-Oh! Legacy of the Duelist",
+    ["zandronum"] = "Zandronum",
+    ["zenlesszonezero"] = "Zenless Zone Zero",
+    ["zenoclash"] = "Zeno Clash",
+    ["zombi"] = "Zombi",
+    ["zombidle"] = "Zombidle: REMONSTERED",
+    ["zps"] = "Zombie Panic! Source",
+    ["蒼の彼方のフォーリズム"] = "Ao no Kanata no Four Rhythm",
+
+}
+
+-- ============================================================================
+-- GAME NAME MAPPINGS (Quick exact matches - highest priority after custom)
+-- ============================================================================
+
+local GAME_NAMES = {
+    -- Popular competitive games
+    ["cs2"] = "Counter-Strike 2",
+    ["csgo"] = "Counter-Strike GO",
+    ["dota2"] = "Dota 2",
+    ["r5apex"] = "Apex Legends",
+    ["valorant-win64-shipping"] = "Valorant",
+    ["fortnite"] = "Fortnite",
+    ["fortnitelient-win64-shipping"] = "Fortnite",
+    ["overwatch"] = "Overwatch 2",
+
+    -- Rockstar Games
+    ["gta5"] = "Grand Theft Auto V",
+    ["gtav"] = "Grand Theft Auto V",
+    ["rdr2"] = "Red Dead Redemption 2",
+
+    -- Survival games
+    ["shootergame"] = "ARK Survival Evolved",
+    ["shootergame_be"] = "ARK Survival Evolved",
+    ["arkascended"] = "ARK Survival Ascended",
+    ["rustclient"] = "Rust",
+
+    -- Minecraft (Java edition)
+    ["javaw"] = "Minecraft",
+    ["java"] = "Minecraft",
+
+    -- War Thunder
+    ["aces"] = "War Thunder",
+
+    -- Final Fantasy XIV
+    ["ffxiv_dx11"] = "Final Fantasy XIV",
+    ["ffxiv"] = "Final Fantasy XIV",
+
+    -- World of Tanks / Warships
+    ["worldoftanks"] = "World of Tanks",
+    ["wotlauncher"] = "World of Tanks",
+    ["worldofwarships"] = "World of Warships",
+    ["wowslauncher"] = "World of Warships",
+
+    -- From Software games
+    ["sekiro"] = "Sekiro",
+    ["eldenring"] = "Elden Ring",
+    ["darksoulsiii"] = "Dark Souls III",
+    ["armoredcore6"] = "Armored Core VI",
+
+    -- Resident Evil
+    ["re2"] = "Resident Evil 2",
+    ["re3"] = "Resident Evil 3",
+    ["re4"] = "Resident Evil 4",
+    ["re8"] = "Resident Evil Village",
+
+    -- Monster Hunter
+    ["monsterhunterworld"] = "Monster Hunter World",
+    ["monsterhunterrise"] = "Monster Hunter Rise",
+
+    -- Path of Exile
+    ["pathofexile"] = "Path of Exile",
+    ["pathofexile_x64"] = "Path of Exile",
+    ["pathofexilesteam"] = "Path of Exile",
+    ["pathofexile_x64steam"] = "Path of Exile",
+
+    -- MMOs
+    ["lostark"] = "Lost Ark",
+    ["newworld"] = "New World",
+    ["warframe"] = "Warframe",
+    ["warframe.x64"] = "Warframe",
+    ["guildwars2-64"] = "Guild Wars 2",
+    ["wow"] = "World of Warcraft",
+    ["wow-64"] = "World of Warcraft",
+
+    -- Battle Royale
+    ["tslgame"] = "PUBG",
+    ["pubg"] = "PUBG",
+
+    -- Blizzard games
+    ["diablo iv"] = "Diablo IV",
+    ["diablo iii"] = "Diablo III",
+    ["hearthstone"] = "Hearthstone",
+    ["starcraft2"] = "StarCraft II",
+
+    -- EA games
+    ["fifa23"] = "FIFA 23",
+    ["fifa24"] = "FC 24",
+    ["deadspace"] = "Dead Space",
+    ["needforspeed"] = "Need for Speed",
+
+    -- Ubisoft games
+    ["acvalhalla"] = "Assassin's Creed Valhalla",
+    ["acmirage"] = "Assassin's Creed Mirage",
+    ["r6-siege"] = "Rainbow Six Siege",
+    ["thedivision2"] = "The Division 2",
+
+    -- Indie favorites
+    ["hollowknight"] = "Hollow Knight",
+    ["celeste"] = "Celeste",
+    ["hades"] = "Hades",
+    ["hadesii"] = "Hades II",
+    ["deadcells"] = "Dead Cells",
+    ["noita"] = "Noita",
+    ["cuphead"] = "Cuphead",
+
+    -- Horror
+    ["phasmophobia"] = "Phasmophobia",
+    ["lethalcompany"] = "Lethal Company",
+    ["contentwarning"] = "Content Warning",
+
+    -- Strategy
+    ["eu4"] = "Europa Universalis IV",
+    ["hoi4"] = "Hearts of Iron IV",
+    ["ck3"] = "Crusader Kings III",
+    ["stellaris"] = "Stellaris",
+    ["civ6"] = "Civilization VI",
+    ["totalwar"] = "Total War",
+
+    -- Riot Games
+    ["valorant"] = "Valorant",
+
+    -- Embark Studios
+    ["discovery"] = "THE FINALS",
+    ["discovery-d"] = "THE FINALS",
+    ["discovery-e"] = "THE FINALS",
+    ["pioneergame"] = "ARC Raiders",
+}
+
+-- ============================================================================
+-- GAME PATTERNS (Keyword matching - used when exact match fails)
+-- ============================================================================
+
+local GAME_PATTERNS = {
+    -- Popular games (process name keywords)
+    {"minecraft", "Minecraft"},
+    {"roblox", "Roblox"},
+    {"fortnite", "Fortnite"},
+    {"valorant", "Valorant"},
+    {"league", "League of Legends"},
+    {"overwatch", "Overwatch 2"},
+    {"warzone", "Call of Duty Warzone"},
+    {"modernwarfare", "Call of Duty"},
+    {"call of duty", "Call of Duty"},
+    {"cod", "Call of Duty"},
+    {"eurotrucks", "Euro Truck Simulator 2"},
+    {"ets2", "Euro Truck Simulator 2"},
+    {"rocketleague", "Rocket League"},
+    {"rustclient", "Rust"},
+    {"pubg", "PUBG"},
+    {"tslgame", "PUBG"},
+    {"rainbowsix", "Rainbow Six Siege"},
+    {"siege", "Rainbow Six Siege"},
+    {"destiny2", "Destiny 2"},
+    {"destiny", "Destiny 2"},
+    {"cyberpunk", "Cyberpunk 2077"},
+    {"witcher", "The Witcher 3"},
+    {"genshin", "Genshin Impact"},
+    {"honkai", "Honkai Star Rail"},
+    {"starrail", "Honkai Star Rail"},
+    {"eldenring", "Elden Ring"},
+    {"darksouls", "Dark Souls"},
+    {"stardew", "Stardew Valley"},
+    {"terraria", "Terraria"},
+    {"amongus", "Among Us"},
+    {"among us", "Among Us"},
+    {"deadbydaylight", "Dead by Daylight"},
+    {"dbd", "Dead by Daylight"},
+    {"hoi4", "Hearts of Iron IV"},
+    {"factorio", "Factorio"},
+    {"baldur", "Baldur's Gate 3"},
+    {"bg3", "Baldur's Gate 3"},
+    {"palworld", "Palworld"},
+    {"phasmophobia", "Phasmophobia"},
+    {"left4dead", "Left 4 Dead 2"},
+    {"l4d", "Left 4 Dead 2"},
+    {"teamfortress", "Team Fortress 2"},
+    {"tf2", "Team Fortress 2"},
+    {"helldivers", "Helldivers 2"},
+    {"starfield", "Starfield"},
+    {"skyrim", "The Elder Scrolls V Skyrim"},
+    {"fallout", "Fallout"},
+    {"diablo", "Diablo"},
+    {"wow", "World of Warcraft"},
+    {"warcraft", "World of Warcraft"},
+    {"apex", "Apex Legends"},
+
+    -- War Thunder / World of Tanks
+    {"warthunder", "War Thunder"},
+    {"gaijin", "War Thunder"},
+    {"worldoftanks", "World of Tanks"},
+    {"wot", "World of Tanks"},
+
+    -- Final Fantasy
+    {"finalfantasy", "Final Fantasy"},
+    {"ffxiv", "Final Fantasy XIV"},
+    {"ff14", "Final Fantasy XIV"},
+    {"ffxvi", "Final Fantasy XVI"},
+
+    -- Additional popular games
+    {"monsterhunter", "Monster Hunter"},
+    {"residentevil", "Resident Evil"},
+    {"pathofexile", "Path of Exile"},
+    {"poe", "Path of Exile"},
+    {"lostark", "Lost Ark"},
+    {"newworld", "New World"},
+    {"warframe", "Warframe"},
+    {"sekiro", "Sekiro"},
+    {"armored core", "Armored Core VI"},
+    {"armoredcore", "Armored Core VI"},
+    {"lies of p", "Lies of P"},
+    {"liesofp", "Lies of P"},
+    {"hogwarts", "Hogwarts Legacy"},
+    {"satisfactory", "Satisfactory"},
+    {"deeprock", "Deep Rock Galactic"},
+    {"valheim", "Valheim"},
+    {"no man", "No Man's Sky"},
+    {"nomans", "No Man's Sky"},
+    {"subnautica", "Subnautica"},
+    {"sims", "The Sims 4"},
+    {"lethal", "Lethal Company"},
+    {"content warning", "Content Warning"},
+
+    -- Games with anti-cheat (detected via window title)
+    {"sea of thieves", "Sea of Thieves"},
+    {"seaofthieves", "Sea of Thieves"},
+    {"7 days", "7 Days to Die"},
+    {"unturned", "Unturned"},
+    {"dayz", "DayZ"},
+    {"tarkov", "Escape from Tarkov"},
+    {"hunt showdown", "Hunt Showdown"},
+    {"dead by daylight", "Dead by Daylight"},
+
+    -- Racing
+    {"forza", "Forza"},
+    {"assetto", "Assetto Corsa"},
+    {"iracing", "iRacing"},
+    {"beamng", "BeamNG.drive"},
+
+    -- Sports
+    {"fifa", "FIFA"},
+    {"nba2k", "NBA 2K"},
+    {"madden", "Madden NFL"},
+
+    -- Simulation
+    {"msfs", "Microsoft Flight Simulator"},
+    {"flightsimulator", "Microsoft Flight Simulator"},
+    {"farming", "Farming Simulator"},
+    {"citieskylines", "Cities Skylines"},
+    {"cities skylines", "Cities Skylines"},
+    {"planet coaster", "Planet Coaster"},
+    {"planetcoaster", "Planet Coaster"},
+}
+
+-- ============================================================================
+-- IGNORE LIST (Programs to skip when detecting games)
+-- Extended in v2.7.0 with ~40 new entries
+-- ============================================================================
+
+local IGNORE_LIST = {
+    -- ═══════════════════════════════════════════════════════════════
+    -- SYSTEM & WINDOWS
+    -- ═══════════════════════════════════════════════════════════════
+    "explorer", "searchapp", "taskmgr", "lockapp", "applicationframehost",
+    "shellexperiencehost", "systemsettings", "textinputhost", "dwm",
+    "nvcplui", "startmenuexperiencehost", "runtimebroker", "sihost",
+    "ctfmon", "dllhost", "conhost", "smartscreen", "securityhealthsystray",
+
+    -- Windows 11 / Xbox
+    "widgets", "windowsterminal", "wt", "gamebarui", "gamebar",
+    "xbox", "xboxapp", "gamingservices", "xboxgamepass", "gamepass",
+    "xboxgamebar", "gamingservicesnet", "xboxpcapp",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- OBS & STREAMING
+    -- ═══════════════════════════════════════════════════════════════
+    "obs64", "obs32", "obs", "streamlabs", "streamlabsobs",
+    "xsplit", "xsplitbroadcaster", "xsplitgamecaster",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- COMMUNICATION
+    -- ═══════════════════════════════════════════════════════════════
+    "discord", "discordptb", "discordcanary", "discordupdate",
+    "telegram", "skype", "teams", "slack", "zoom", "viber",
+    "whatsapp", "signal", "guilded", "element", "mumble",
+    "teamspeak", "teamspeak3", "ts3client_win64", "ventrilo",
+    "vencord", "betterdiscord", "vesktop", "webcord",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- BROWSERS
+    -- ═══════════════════════════════════════════════════════════════
+    "chrome", "firefox", "opera", "msedge", "brave", "vivaldi", "safari",
+    "iexplore", "chromium", "waterfox", "librewolf", "floorp", "arc",
+    "thorium", "ungoogled", "yandex", "maxthon",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- MEDIA PLAYERS
+    -- ═══════════════════════════════════════════════════════════════
+    "spotify", "vlc", "wmplayer", "groove", "itunes", "foobar2000",
+    "musicbee", "winamp", "deezer", "tidal", "amazonmusic", "mpv",
+    "aimp", "qmmp", "potplayer", "mpc-hc", "mpc-be", "mediamonkey",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- GAME LAUNCHERS - MAJOR (v2.7.0 Extended)
+    -- ═══════════════════════════════════════════════════════════════
+
+    -- Steam
+    "steam", "steamwebhelper", "steamservice", "steamerrorreporter",
+    "steamclient", "steampresence",
+
+    -- Epic Games
+    "epicgameslauncher", "epicwebhelper", "epiconlineservices",
+    "eosoverlayrenderer", "eosoverlay",
+
+    -- EA / Origin
+    "origin", "eadesktop", "eaapp", "eabackgroundservice",
+    "originwebhelperservice", "igoproxy",
+
+    -- GOG Galaxy
+    "gog", "gogalaxy", "galaxyclient", "galaxycommunication",
+    "gogalaxynotifications",
+
+    -- Battle.net / Blizzard
+    "battle.net", "blizzard", "bnet", "agent", "blizzard error reporter",
+
+    -- Riot Games
+    "riotclient", "riotclientservices", "riot client", "riotclientux",
+    "riotclientcrashhandler", "vanguard",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- GAME LAUNCHERS - PUBLISHER SPECIFIC (v2.7.0 New)
+    -- ═══════════════════════════════════════════════════════════════
+
+    -- Ubisoft Connect (NEW)
+    "ubisoftconnect", "upc", "ubisoftgamelauncher", "uplay",
+    "ubisoft game launcher", "ubiconnect", "ubisoft connect",
+
+    -- Rockstar Games (NEW)
+    "rockstarlauncher", "rgsclauncher", "gtavlauncher",
+    "playgtaiv", "playrdr", "rockstar games launcher",
+    "socialclub", "socialclubhelper",
+
+    -- Paradox (NEW)
+    "paradoxlauncher", "paradox launcher", "bootstrapper",
+
+    -- Nexon (NEW)
+    "nexonlauncher", "nexon_client", "nexon_runtime",
+
+    -- 2K Games (NEW)
+    "launcherpatcher", "2klauncher",
+
+    -- Pearl Abyss (NEW)
+    "blackdesertlauncher", "pearlabyss",
+
+    -- Bethesda
+    "bethesda", "bethesdanetlauncher",
+
+    -- Amazon Games
+    "amazongames", "primegaming", "amazongameslauncher",
+
+    -- Level Infinite / Tencent
+    "arenabreakoutlauncher",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- GAME LAUNCHERS - INDIE / OTHER (v2.7.0 New)
+    -- ═══════════════════════════════════════════════════════════════
+
+    -- itch.io (NEW)
+    "itch", "itchio", "butler",
+
+    -- IndieGala (NEW)
+    "igclient", "indiegalaclient",
+
+    -- Misc launchers (NEW)
+    "legacygames", "humblegames", "glyph", "glyphclient",
+    "vkplay", "hoyo", "hoyoplay", "wargaming", "gamecenterlauncher",
+
+    -- Playnite
+    "playnite", "playnite.fullscreenapp", "playnite.desktopapp",
+
+    -- Twitch
+    "twitch", "twitchsetup",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- EDITING SOFTWARE
+    -- ═══════════════════════════════════════════════════════════════
+    "photoshop", "lightroom", "gimp", "paint", "mspaint", "paint3d",
+    "premiere", "aftereffects", "davinci", "resolve", "vegas",
+    "audacity", "audition", "capcut", "kdenlive", "shotcut",
+    "clipstudio", "krita", "inkscape", "blender",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- OVERLAYS & HARDWARE UTILITIES (v2.7.0 Extended)
+    -- ═══════════════════════════════════════════════════════════════
+
+    -- NVIDIA
+    "nvidia share", "geforce", "shadowplay", "geforceexperience",
+    "nvcontainer", "nvspcaps", "nvdisplay.container",
+
+    -- AMD
+    "amd", "radeon", "adrenalin", "radeonsoftware", "amddow",
+
+    -- Intel
+    "igcc", "oneapp.igcc",
+
+    -- Overlays
+    "overwolf", "medal", "playstv", "raptr",
+
+    -- Hardware utilities
+    "corsair", "icue", "razer", "synapse", "logitech", "lghub",
+    "steelseries", "gg", "steelseriesengine",
+    "msiafterburner", "afterburner", "rivatuner", "rtss",
+    "nzxt", "nzxtcam", "hwinfo", "hwinfo64", "cpuz", "gpuz",
+    "fpsmonitor", "fraps",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- MOD MANAGERS (v2.7.0 New)
+    -- ═══════════════════════════════════════════════════════════════
+    "vortex", "modorganizer", "modorganizer2", "nexusmods",
+    "r2modman", "thunderstore", "curseforge", "overwolfcurseforge",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- DESKTOP CUSTOMIZATION
+    -- ═══════════════════════════════════════════════════════════════
+    "ui32", "wallpaper32", "wallpaper64", "wallpaperengine", "wallpaperui",
+    "rainmeter", "fences", "objectdock",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- AUDIO UTILITIES
+    -- ═══════════════════════════════════════════════════════════════
+    "eartrumpet", "voicemeeter", "voicemeeterpotato", "voicemeeterbanana",
+    "equalizer apo", "soundpad", "voicemod",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- AUTOMATION TOOLS
+    -- ═══════════════════════════════════════════════════════════════
+    "gt auto clicker", "autoclicker", "autohotkey",
+    "autohotkey64", "autohotkey32",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- SYSTEM UTILITIES
+    -- ═══════════════════════════════════════════════════════════════
+    "powertoys", "everything", "wox", "listary", "keypirinha",
+    "quicklook", "files",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- TORRENT CLIENTS
+    -- ═══════════════════════════════════════════════════════════════
+    "qbittorrent", "utorrent", "bittorrent", "deluge", "transmission",
+    "tixati", "vuze",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- VPN & NETWORK
+    -- ═══════════════════════════════════════════════════════════════
+    "rvrvpngui", "cloudflare warp", "nordvpn", "expressvpn",
+    "protonvpn", "mullvad", "wireguard", "openvpn",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- RECORDING & SCREENSHOTS
+    -- ═══════════════════════════════════════════════════════════════
+    "sharex", "lightshot", "greenshot", "bandicam", "fraps",
+    "action", "screentogif", "snipaste", "snagit", "camtasia",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- REMOTE DESKTOP (v2.7.0 Extended)
+    -- ═══════════════════════════════════════════════════════════════
+    "anydesk", "teamviewer", "parsec", "moonlight", "sunshine",
+    "nomachine", "chrome remote desktop", "rustdesk",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- DEVELOPMENT
+    -- ═══════════════════════════════════════════════════════════════
+    "code", "vscode", "sublime", "notepad", "notepad++", "atom",
+    "visual studio", "devenv", "idea", "idea64", "pycharm", "webstorm",
+    "rider", "datagrip", "phpstorm", "goland", "clion", "rubymine",
+    "cursor", "zed", "fleet",
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- UTILITIES & MISC
+    -- ═══════════════════════════════════════════════════════════════
+    "7zfm", "winrar", "filezilla", "putty", "terminal", "powershell",
+    "cmd", "conhost", "windowsterminal", "wezterm", "alacritty",
+
+    -- Cloud storage
+    "dropbox", "onedrive", "icloud", "googledrive", "megasync",
+
+    -- Google apps
+    "google", "googlecrashhandler", "googledrivesync", "backup",
+
+    -- Misc
+    "processhacker", "procexp", "procexp64",
+}
+
+-- Build hash set for O(1) exact process name matching
+-- (IGNORE_LIST array is kept for window title substring matching in get_game_folder)
+local IGNORE_SET = {}
+for _, v in ipairs(IGNORE_LIST) do IGNORE_SET[v] = true end
+
+
+-- ============================================================================
+-- CUSTOM NAMES (User-defined mappings from GUI)
+-- Format: executable or path > Display Name
+-- Keywords mode: +keyword1 keyword2 > Display Name (all words must match)
+-- Contains mode: *text* > Display Name (partial match in window title)
+-- ============================================================================
+
+local CUSTOM_NAMES_EXACT = {}     -- {["process"] = "Folder Name"} for exact matches
+local CUSTOM_NAMES_KEYWORDS = {}  -- {{keywords = {"word1", "word2"}, name = "Folder"}, ...}
+local CUSTOM_NAMES_CONTAINS = {}  -- {{pattern = "text", name = "Folder"}, ...} for *pattern* mode
+
+-- Parse a single custom name entry
+-- Supports formats:
+--   "C:\path\to\game.exe > Custom Name"  (exact match)
+--   "game.exe > Custom Name"              (exact match)
+--   "game > Custom Name"                  (exact match)
+--   "+keyword1 keyword2 > Custom Name"    (keywords mode - all words must be present)
+--   "*pattern* > Custom Name"             (contains mode - matches if text contains pattern)
+-- Returns: result, name, mode
+--   mode: "exact", "keywords", or "contains"
+local function parse_custom_entry(entry)
+    if not entry or entry == "" then return nil, nil, nil end
+
+    -- Split by " > " separator
+    local path, name = string.match(entry, "^(.+)%s*>%s*(.+)$")
+    if not path or not name then return nil, nil, nil end
+
+    -- Trim whitespace
+    path = string.gsub(path, "^%s+", "")
+    path = string.gsub(path, "%s+$", "")
+    name = string.gsub(name, "^%s+", "")
+    name = string.gsub(name, "%s+$", "")
+
+    if path == "" or name == "" then return nil, nil, nil end
+
+    -- Check for contains mode (wrapped in *...*)
+    if string.sub(path, 1, 1) == "*" and string.sub(path, -1) == "*" and #path > 2 then
+        local pattern = string.sub(path, 2, -2)  -- Remove * from both ends
+        pattern = string.gsub(pattern, "^%s+", "")  -- Trim leading space
+        pattern = string.gsub(pattern, "%s+$", "")  -- Trim trailing space
+
+        if pattern ~= "" then
+            return string.lower(pattern), name, "contains"
+        else
+            return nil, nil, nil
+        end
+    end
+
+    -- Check for keywords mode (starts with + or ~)
+    if string.sub(path, 1, 1) == "+" or string.sub(path, 1, 1) == "~" then
+        local keywords_str = string.sub(path, 2)  -- Remove +/~ prefix
+        keywords_str = string.gsub(keywords_str, "^%s+", "")  -- Trim leading space
+
+        local keywords = {}
+        for word in string.gmatch(keywords_str, "%S+") do
+            table.insert(keywords, string.lower(word))
+        end
+
+        if #keywords > 0 then
+            return keywords, name, "keywords"
+        else
+            return nil, nil, nil
+        end
+    end
+
+    -- Exact match mode: extract just the executable name from full path
+    -- Handle both forward and back slashes
+    local exe = string.match(path, "([^/\\]+)$") or path
+    -- Remove .exe extension if present
+    exe = string.gsub(exe, "%.[eE][xX][eE]$", "")
+
+    return string.lower(exe), name, "exact"
+end
+
+-- Load custom names from OBS data array
+local function load_custom_names(settings)
+    CUSTOM_NAMES_EXACT = {}
+    CUSTOM_NAMES_KEYWORDS = {}
+    CUSTOM_NAMES_CONTAINS = {}
+
+    local array = obs.obs_data_get_array(settings, "custom_names")
+    if not array then return end
+
+    local count = obs.obs_data_array_count(array)
+    for i = 0, count - 1 do
+        local item = obs.obs_data_array_item(array, i)
+        local entry = obs.obs_data_get_string(item, "value")
+        obs.obs_data_release(item)
+
+        local result, name, mode = parse_custom_entry(entry)
+        if result and name and mode then
+            if mode == "keywords" then
+                -- Keywords mode: result is a table of keywords
+                table.insert(CUSTOM_NAMES_KEYWORDS, {
+                    keywords = result,
+                    name = name
+                })
+            elseif mode == "contains" then
+                -- Contains mode: result is a pattern string
+                table.insert(CUSTOM_NAMES_CONTAINS, {
+                    pattern = result,
+                    name = name
+                })
+            else
+                -- Exact match mode: result is a string (exe name)
+                CUSTOM_NAMES_EXACT[result] = name
+            end
+        end
+    end
+
+    obs.obs_data_array_release(array)
+end
+
+-- Check if text contains all keywords (case-insensitive)
+local function matches_keywords(text, keywords)
+    if not text or not keywords then return false end
+    local lower = string.lower(text)
+    for _, keyword in ipairs(keywords) do
+        if not string.find(lower, keyword, 1, true) then
+            return false  -- Missing keyword
+        end
+    end
+    return true  -- All keywords found
+end
+
+-- Check if text contains pattern (case-insensitive)
+local function matches_contains(text, pattern)
+    if not text or not pattern then return false end
+    local lower_text = string.lower(text)
+    return string.find(lower_text, pattern, 1, true) ~= nil
+end
+
+-- Check if a process/window matches any custom name
+-- Supports exact match, keywords mode, and contains mode
+-- Both process_name and window_title can be nil - we check whatever is available
+-- PRIORITY: Custom names ALWAYS override everything else!
+local function get_custom_name(process_name, window_title)
+    local lower = nil
+    local lower_no_ext = nil
+
+    -- Prepare process name for matching (if available)
+    if process_name and process_name ~= "" then
+        lower = string.lower(process_name)
+        -- Remove .exe if present for exact matching
+        lower_no_ext = string.gsub(lower, "%.[eE][xX][eE]$", "")
+
+        -- 1. Try exact match first (fast, highest priority) - only if process name available
+        if CUSTOM_NAMES_EXACT[lower_no_ext] then
+            return CUSTOM_NAMES_EXACT[lower_no_ext]
+        end
+        -- Also try with .exe extension in case user entered it that way
+        if CUSTOM_NAMES_EXACT[lower] then
+            return CUSTOM_NAMES_EXACT[lower]
+        end
+    end
+
+    -- 2. Try contains matching (checks both process name AND window title)
+    -- This works even when process_name is nil (anti-cheat blocked it)
+    for _, entry in ipairs(CUSTOM_NAMES_CONTAINS) do
+        -- Check process name if available
+        if lower and matches_contains(process_name, entry.pattern) then
+            return entry.name
+        end
+        -- Check window title (IMPORTANT: works even when process is nil!)
+        if window_title and matches_contains(window_title, entry.pattern) then
+            return entry.name
+        end
+    end
+
+    -- 3. Try keywords matching (check against original name with spaces/version info)
+    for _, entry in ipairs(CUSTOM_NAMES_KEYWORDS) do
+        -- Check process name if available
+        if lower and matches_keywords(process_name, entry.keywords) then
+            return entry.name
+        end
+        -- Check window title (IMPORTANT: works even when process is nil!)
+        if window_title and matches_keywords(window_title, entry.keywords) then
+            return entry.name
+        end
+    end
+
+    return nil
+end
+
+-- ============================================================================
+-- STATE
+-- ============================================================================
+
+-- ============================================================================
+-- STATE  (all mutable runtime state, namespaced into one table to conserve
+-- Lua's 200 main-chunk local-variable limit)
+-- ============================================================================
+local STATE = {
+    -- Cooldowns / detection cache
+    last_save_time = 0,
+    last_screenshot_time = 0,
+    last_screenshot_notify_time = 0,
+    cache_raw_game = nil,
+    cache_folder_name = nil,
+    last_detection_time = 0,
+    last_recording_time = 0,
+    files_moved = 0,
+    files_skipped = 0,
+    script_settings = nil,
+
+    -- Recording signal handler state
+    recording_signal_handler = nil,
+    recording_output_ref = nil,
+    recording_game_name = nil,
+    recording_folder_name = nil,
+    recording_session_stamp = nil,
+    recording_split_index = 0,
+    chapter_count = 0,
+    chapter_hotkey_id = nil,
+    failed_moves = {},
+
+    -- Notification handles / fonts (GDI)
+    notification_hwnd = nil,
+    notification_hinstance = nil,
+    notification_bg_brush = nil,
+    notification_font = nil,
+    cached_title_font = nil,
+    cached_msg_font = nil,
+    last_font_scale = 100,
+
+    -- Notification render state
+    notification_end_time = 0,
+    notification_title = "",
+    notification_message = "",
+    notification_alpha = 0,
+    notification_fade_state = "none",
+    notification_window_shown = false,
+    notification_wndproc = nil,
+    notification_class_atom = nil,
+    notification_destroying = false,
+    notification_timer_should_stop = false,
+
+    -- Update checker state
+    startup_update_status = "📦 v" .. VERSION,
+    startup_update_check_done = false,
+
+    -- Deferred replay move queue (v2.10.0 - Replay Buffer Pro compatibility)
+    pending_moves = {},
+    move_timer_running = false,
+    rbp_active = false,
+    last_flushed_path = nil,
+    last_flushed_time = 0,
+}
+
+-- ============================================================================
+-- LOGGING (defined early for use in notification system)
+-- ============================================================================
+
+local function log(msg)
+    print("[Smart Replay] " .. msg)
+end
+
+local function dbg(msg)
+    if CONFIG.debug_mode then
+        print("[Smart Replay DEBUG] " .. msg)
+    end
+end
+
+-- ============================================================================
+-- WINDOWS API
+-- ============================================================================
+
+user32 = nil
+kernel32 = nil
+psapi = nil
+gdi32 = nil
+winmm = nil
+shell32 = nil
+ffmpeg_shell32 = nil
+ffmpeg_kernel32 = nil
+
+if IS_WINDOWS and ffi then
+    local load_ok = pcall(function()
+        ffi.cdef[[
+            typedef unsigned long DWORD;
+            typedef void* HANDLE;
+            typedef void* HWND;
+            typedef int BOOL;
+            typedef const char* LPCSTR;
+            typedef const unsigned short* LPCWSTR;
+            typedef unsigned short* LPWSTR;
+            typedef unsigned short wchar_t;
+            typedef void* HINSTANCE;
+            typedef void* HICON;
+            typedef void* HCURSOR;
+            typedef void* HBRUSH;
+            typedef void* HDC;
+            typedef void* HFONT;
+            typedef void* HGDIOBJ;
+            typedef unsigned int UINT;
+            typedef long LONG;
+            typedef int64_t LONG_PTR;
+            typedef uint64_t UINT_PTR;
+            typedef UINT_PTR WPARAM;
+            typedef LONG_PTR LPARAM;
+            typedef LONG_PTR LRESULT;
+            typedef unsigned short WORD;
+            typedef unsigned short ATOM;
+            typedef unsigned char BYTE;
+            typedef DWORD COLORREF;
+
+            HWND GetForegroundWindow();
+            DWORD GetWindowThreadProcessId(HWND hWnd, DWORD* lpdwProcessId);
+            HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+            BOOL CloseHandle(HANDLE hObject);
+            DWORD GetModuleBaseNameA(HANDLE hProcess, void* hModule, char* lpBaseName, DWORD nSize);
+            DWORD GetModuleBaseNameW(HANDLE hProcess, void* hModule, wchar_t* lpBaseName, DWORD nSize);
+            int GetWindowTextA(HWND hWnd, char* lpString, int nMaxCount);
+            int GetWindowTextW(HWND hWnd, wchar_t* lpString, int nMaxCount);
+            BOOL QueryFullProcessImageNameA(HANDLE hProcess, DWORD dwFlags, char* lpExeName, DWORD* lpdwSize);
+            BOOL QueryFullProcessImageNameW(HANDLE hProcess, DWORD dwFlags, wchar_t* lpExeName, DWORD* lpdwSize);
+
+            int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, LPCSTR lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar);
+            int WideCharToMultiByte(unsigned int CodePage, DWORD dwFlags, const wchar_t* lpWideCharStr, int cchWideChar, char* lpMultiByteStr, int cbMultiByte, const char* lpDefaultChar, int* lpUsedDefaultChar);
+            BOOL DeleteFileW(LPCWSTR lpFileName);
+            HANDLE CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+            BOOL IsWindow(HWND hWnd);
+
+            // Toolhelp32 Snapshot
+            typedef struct tagPROCESSENTRY32 {
+                DWORD dwSize;
+                DWORD cntUsage;
+                DWORD th32ProcessID;
+                UINT_PTR th32DefaultHeapID;
+                DWORD th32ModuleID;
+                DWORD cntThreads;
+                DWORD th32ParentProcessID;
+                LONG  pcPriClassBase;
+                DWORD dwFlags;
+                char szExeFile[260];
+            } PROCESSENTRY32;
+
+            HANDLE CreateToolhelp32Snapshot(DWORD dwFlags, DWORD th32ProcessID);
+            BOOL Process32First(HANDLE hSnapshot, void* lppe);
+            BOOL Process32Next(HANDLE hSnapshot, void* lppe);
+
+            typedef struct {
+                DWORD dwFileAttributes;
+                DWORD ftCreationTime_L; DWORD ftCreationTime_H;
+                DWORD ftLastAccessTime_L; DWORD ftLastAccessTime_H;
+                DWORD ftLastWriteTime_L; DWORD ftLastWriteTime_H;
+                DWORD nFileSizeHigh;
+                DWORD nFileSizeLow;
+                DWORD dwReserved0;
+                DWORD dwReserved1;
+                char cFileName[260];
+                char cAlternateFileName[14];
+            } WIN32_FIND_DATAA;
+
+            typedef struct {
+                DWORD dwFileAttributes;
+                DWORD ftCreationTime_L; DWORD ftCreationTime_H;
+                DWORD ftLastAccessTime_L; DWORD ftLastAccessTime_H;
+                DWORD ftLastWriteTime_L; DWORD ftLastWriteTime_H;
+                DWORD nFileSizeHigh;
+                DWORD nFileSizeLow;
+                DWORD dwReserved0;
+                DWORD dwReserved1;
+                unsigned short cFileName[260];
+                unsigned short cAlternateFileName[14];
+            } WIN32_FIND_DATAW;
+
+            HANDLE FindFirstFileA(LPCSTR lpFileName, void* lpFindFileData);
+            HANDLE FindFirstFileW(LPCWSTR lpFileName, void* lpFindFileData);
+            BOOL FindNextFileW(HANDLE hFindFile, void* lpFindFileData);
+            BOOL FindClose(HANDLE hFindFile);
+
+            // Custom Notification Window API
+            typedef LRESULT (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);
+
+            typedef struct tagWNDCLASSA {
+                UINT      style;
+                WNDPROC   lpfnWndProc;
+                int       cbClsExtra;
+                int       cbWndExtra;
+                HINSTANCE hInstance;
+                HICON     hIcon;
+                HCURSOR   hCursor;
+                HBRUSH    hbrBackground;
+                LPCSTR    lpszMenuName;
+                LPCSTR    lpszClassName;
+            } WNDCLASSA;
+
+            typedef struct tagRECT {
+                LONG left;
+                LONG top;
+                LONG right;
+                LONG bottom;
+            } RECT;
+
+            typedef struct tagPAINTSTRUCT {
+                HDC  hdc;
+                BOOL fErase;
+                RECT rcPaint;
+                BOOL fRestore;
+                BOOL fIncUpdate;
+                BYTE rgbReserved[32];
+            } PAINTSTRUCT;
+
+            ATOM RegisterClassA(const WNDCLASSA* lpWndClass);
+            BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance);
+            HWND CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, void* hMenu, HINSTANCE hInstance, void* lpParam);
+            BOOL DestroyWindow(HWND hWnd);
+            BOOL ShowWindow(HWND hWnd, int nCmdShow);
+            BOOL SetLayeredWindowAttributes(HWND hwnd, COLORREF crKey, BYTE bAlpha, DWORD dwFlags);
+            BOOL SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags);
+            LRESULT DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam);
+
+            // GDI
+            HDC GetDC(HWND hWnd);
+            int ReleaseDC(HWND hWnd, HDC hDC);
+            HDC BeginPaint(HWND hWnd, PAINTSTRUCT* lpPaint);
+            BOOL EndPaint(HWND hWnd, const PAINTSTRUCT* lpPaint);
+
+            HFONT CreateFontA(int cHeight, int cWidth, int cEscapement, int cOrientation,
+                              int cWeight, DWORD bItalic, DWORD bUnderline, DWORD bStrikeOut,
+                              DWORD iCharSet, DWORD iOutPrecision, DWORD iClipPrecision,
+                              DWORD iQuality, DWORD iPitchAndFamily, LPCSTR pszFaceName);
+            HGDIOBJ SelectObject(HDC hdc, HGDIOBJ h);
+            BOOL DeleteObject(HGDIOBJ ho);
+            int SetBkMode(HDC hdc, int mode);
+            COLORREF SetTextColor(HDC hdc, COLORREF color);
+            BOOL TextOutA(HDC hdc, int x, int y, LPCSTR lpString, int c);
+            int DrawTextA(HDC hdc, LPCSTR lpchText, int cchText, RECT* lprc, UINT format);
+            int DrawTextW(HDC hdc, LPCWSTR lpchText, int cchText, RECT* lprc, UINT format);
+            HBRUSH CreateSolidBrush(COLORREF color);
+            int FillRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
+            BOOL GetClientRect(HWND hWnd, RECT* lpRect);
+
+            // Sound function
+            BOOL PlaySoundA(LPCSTR pszSound, HINSTANCE hmod, DWORD fdwSound);
+
+            // Shell function for fullscreen detection
+            long SHQueryUserNotificationState(int* pquns);
+
+            // Window search & module handle
+            HWND FindWindowA(LPCSTR lpClassName, LPCSTR lpWindowName);
+            HINSTANCE GetModuleHandleA(LPCSTR lpModuleName);
+            int GetSystemMetrics(int nIndex);
+            UINT WinExec(LPCSTR lpCmdLine, UINT uCmdShow);
+
+            // Extended window class (used by notification system)
+            typedef struct tagWNDCLASSEXA {
+                UINT      cbSize;
+                UINT      style;
+                WNDPROC   lpfnWndProc;
+                int       cbClsExtra;
+                int       cbWndExtra;
+                HINSTANCE hInstance;
+                HICON     hIcon;
+                HCURSOR   hCursor;
+                HBRUSH    hbrBackground;
+                LPCSTR    lpszMenuName;
+                LPCSTR    lpszClassName;
+                HICON     hIconSm;
+            } WNDCLASSEXA;
+
+            ATOM RegisterClassExA(const WNDCLASSEXA* lpwcx);
+            
+            // FFMpeg ShellExecute API
+            typedef struct {
+                DWORD cbSize;
+                DWORD fMask;
+                HWND hwnd;
+                LPCSTR lpVerb;
+                LPCSTR lpFile;
+                LPCSTR lpParameters;
+                LPCSTR lpDirectory;
+                int nShow;
+                HINSTANCE hInstApp;
+                void* lpIDList;
+                LPCSTR lpClass;
+                void* hkeyClass;
+                DWORD dwHotKey;
+                union { HANDLE hIcon; HANDLE hMonitor; } DUMMYUNIONNAME;
+                HANDLE hProcess;
+            } SHELLEXECUTEINFOA;
+
+            BOOL ShellExecuteExA(SHELLEXECUTEINFOA *pExecInfo);
+            DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
+            BOOL GetExitCodeProcess(HANDLE hProcess, DWORD* lpExitCode);
+        ]]
+
+        user32 = ffi.load("user32")
+        kernel32 = ffi.load("kernel32")
+        psapi = ffi.load("psapi")
+        gdi32 = ffi.load("gdi32")
+        ffmpeg_shell32 = ffi.load("shell32")
+        ffmpeg_kernel32 = kernel32
+        pcall(function() winmm = ffi.load("winmm") end)
+        pcall(function() shell32 = ffi.load("shell32") end)
+    end)
+    WINDOWS_FFI_AVAILABLE = load_ok and user32 ~= nil
+end
+
+VISUAL_NOTIFICATIONS_SUPPORTED = WINDOWS_FFI_AVAILABLE
+
+-- ============================================================================
+-- WIN32 CONSTANTS  (namespaced into one table to conserve Lua's hard limit of
+-- 200 local variables in the main chunk; see NOTIF / STATE tables too)
+-- ============================================================================
+local WIN = {
+    -- Process access / Toolhelp snapshot
+    PROCESS_QUERY_INFORMATION = 0x0400,
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000,
+    PROCESS_VM_READ = 0x0010,
+    TH32CS_SNAPPROCESS = 0x00000002,
+
+    -- Code pages
+    CP_UTF8 = 65001,
+    CP_ACP = 0,
+    MAX_PATH = 260,
+
+    -- Window styles
+    WS_POPUP = 0x80000000,
+    WS_VISIBLE = 0x10000000,
+    WS_EX_TOPMOST = 0x00000008,
+    WS_EX_TRANSPARENT = 0x00000020,
+    WS_EX_LAYERED = 0x00080000,
+    WS_EX_TOOLWINDOW = 0x00000080,
+    WS_EX_NOACTIVATE = 0x08000000,
+
+    -- SetWindowPos flags
+    SWP_NOSIZE = 0x0001,
+    SWP_NOMOVE = 0x0002,
+    SWP_NOACTIVATE = 0x0010,
+
+    -- ShowWindow / misc
+    SW_HIDE = 0,
+    SW_SHOWNOACTIVATE = 4,
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040,
+    WAIT_OBJECT_0 = 0x00000000,
+    LWA_ALPHA = 0x00000002,
+    SM_CXSCREEN = 0,
+    SM_CYSCREEN = 1,
+    TRANSPARENT = 1,
+
+    -- Font (CreateFontA)
+    FW_BOLD = 700,
+    DEFAULT_CHARSET = 1,
+    OUT_DEFAULT_PRECIS = 0,
+    CLIP_DEFAULT_PRECIS = 0,
+    CLEARTYPE_QUALITY = 5,
+    DEFAULT_PITCH = 0,
+
+    -- DrawText flags
+    DT_CENTER = 0x00000001,
+    DT_VCENTER = 0x00000004,
+    DT_SINGLELINE = 0x00000020,
+
+    -- PlaySound flags
+    SND_ASYNC = 0x0001,
+    SND_ALIAS = 0x00010000,
+    SND_FILENAME = 0x00020000,
+    SND_NODEFAULT = 0x0002,
+
+    -- Fullscreen detection
+    QUNS_RUNNING_D3D_FULL_SCREEN = 3,
+
+    -- Window messages / class styles
+    WM_PAINT = 0x000F,
+    WM_ERASEBKGND = 0x0014,
+    WM_DESTROY = 0x0002,
+    CS_HREDRAW = 0x0002,
+    CS_VREDRAW = 0x0001,
+
+    -- Colors (BGR format for Windows)
+    COLOR_BG = 0x00252525,
+    COLOR_TEXT = 0x00FFFFFF,
+    COLOR_ACCENT = 0x0000D4AA,
+
+    -- Conversion buffers / misc
+    MAX_WIDE_BUFFER = 4096,
+    MAX_UTF8_BUFFER = 8192,
+    INFINITE = 0xFFFFFFFF,
+
+    -- File access (exclusive-open probe for the deferred move queue)
+    GENERIC_READ = 0x80000000,
+    OPEN_EXISTING = 3,
+    FILE_ATTRIBUTE_NORMAL = 0x80,
+
+    -- HWND_TOPMOST is assigned below (needs a runtime ffi.cast)
+    HWND_TOPMOST = nil,
+}
+
+-- HWND_TOPMOST for SetWindowPos (requires an FFI cast at runtime)
+if WINDOWS_FFI_AVAILABLE and ffi then
+    WIN.HWND_TOPMOST = ffi.cast("HWND", ffi.cast("intptr_t", -1))
+end
+
+local function utf8_to_wide(str)
+    if not str or str == "" then return nil end
+    if not kernel32 then return nil end
+
+    if #str > WIN.MAX_WIDE_BUFFER * 4 then
+        str = string.sub(str, 1, WIN.MAX_WIDE_BUFFER * 4)
+    end
+
+    local ok, result = pcall(function()
+        local size = kernel32.MultiByteToWideChar(WIN.CP_UTF8, 0, str, -1, nil, 0)
+        if size == 0 or size > WIN.MAX_WIDE_BUFFER then return nil end
+        local buf = ffi.new("unsigned short[?]", size)
+        kernel32.MultiByteToWideChar(WIN.CP_UTF8, 0, str, -1, buf, size)
+        return buf
+    end)
+
+    return ok and result or nil
+end
+
+-- ============================================================================
+-- ENCODING HELPERS  (UTF-16 <-> UTF-8)
+-- OBS speaks UTF-8 everywhere; the Win32 wide (*W) APIs speak UTF-16. These
+-- bridge the two with NO legacy code page involved, so process and folder names
+-- in ANY language (Chinese, Japanese, Korean, Cyrillic, ...) round-trip intact.
+-- ============================================================================
+
+-- Convert a UTF-16 (wide) buffer to a UTF-8 Lua string.
+local function wide_to_utf8(wide_buffer, wide_len)
+    if not WINDOWS_FFI_AVAILABLE then return nil end
+    if wide_len <= 0 or wide_len > WIN.MAX_WIDE_BUFFER then return nil end
+
+    local ok, result = pcall(function()
+        local size_needed = kernel32.WideCharToMultiByte(WIN.CP_UTF8, 0, wide_buffer, wide_len, nil, 0, nil, nil)
+        if size_needed <= 0 or size_needed > WIN.MAX_UTF8_BUFFER then return nil end
+
+        local utf8_buffer = ffi.new("char[?]", size_needed + 1)
+        local conv_result = kernel32.WideCharToMultiByte(WIN.CP_UTF8, 0, wide_buffer, wide_len, utf8_buffer, size_needed, nil, nil)
+
+        if conv_result > 0 then
+            return ffi.string(utf8_buffer, conv_result)
+        end
+        return nil
+    end)
+
+    return ok and result or nil
+end
+
+-- Length (in UTF-16 code units) of a NUL-terminated wide buffer, capped at max.
+local function wide_strlen(wbuf, max)
+    local n = 0
+    while n < max and wbuf[n] ~= 0 do
+        n = n + 1
+    end
+    return n
+end
+
+-- Truncate a UTF-8 string to at most max_bytes WITHOUT splitting a multi-byte
+-- character (UTF-8 continuation bytes are 0x80..0xBF).
+local function utf8_truncate(str, max_bytes)
+    if not str or #str <= max_bytes then return str end
+    local cut = max_bytes
+    while cut > 0 do
+        local b = string.byte(str, cut + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end  -- next byte starts a new char
+        cut = cut - 1
+    end
+    return string.sub(str, 1, cut)
+end
+
+-- ============================================================================
+-- NOTIFICATION SYSTEM
+-- ============================================================================
+
+-- Notification window dimensions, animation and identity (namespaced)
+local NOTIF = {
+    NOTIFICATION_WIDTH = 300,
+    NOTIFICATION_HEIGHT = 70,
+    NOTIFICATION_MARGIN = 20,
+    NOTIFICATION_WINDOW_TITLE = "SmartReplayMoverNotification",
+    FADE_STEP = 25,
+    FADE_MAX_ALPHA = 230,
+    FADE_INTERVAL = 20,
+    NOTIFICATION_CLASS_NAME = "SmartReplayNotificationClass",
+}
+
+-- Update checker state
+-- On Linux, the per-user runtime dir instead of a fixed name in a /tmp shared by all users.
+local GITHUB_VERSION_FILE = join_path(
+    (not IS_WINDOWS_REAL and get_env_first("XDG_RUNTIME_DIR")) or TEMP_DIR,
+    "smart_replay_mover_update.txt"
+)
+
+-- Check if app is in exclusive fullscreen mode
+local function is_exclusive_fullscreen()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return false end
+    if shell32 == nil then return false end
+
+    local ok, result = pcall(function()
+        local state = ffi.new("int[1]")
+        local hr = shell32.SHQueryUserNotificationState(state)
+        if hr == 0 then
+            local is_fs = state[0] == WIN.QUNS_RUNNING_D3D_FULL_SCREEN
+            if is_fs then
+                dbg("SHQueryUserNotificationState: D3D exclusive fullscreen detected (state=" .. state[0] .. ")")
+            end
+            return is_fs
+        end
+        return false
+    end)
+
+    return ok and result or false
+end
+
+-- Find and destroy any orphaned notification windows
+local function destroy_orphaned_notifications()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    pcall(function()
+        -- Only target OUR specific window class to avoid instability
+        for i = 1, 10 do
+            local orphan = user32.FindWindowA(NOTIF.NOTIFICATION_CLASS_NAME, nil)
+            if orphan == nil or orphan == ffi.cast("HWND", 0) then
+                break
+            end
+            
+            -- If it's NOT our current handle, kill it
+            if orphan ~= STATE.notification_hwnd then
+                user32.ShowWindow(orphan, WIN.SW_HIDE)
+                user32.DestroyWindow(orphan)
+                dbg("Destroyed orphaned notification window")
+            else
+                break
+            end
+        end
+    end)
+end
+
+-- Hide current notification (immediate)
+local function hide_notification()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    if STATE.notification_destroying then return end
+
+    local hwnd = STATE.notification_hwnd
+    if hwnd == nil then return end
+
+    STATE.notification_destroying = true
+
+    STATE.notification_fade_state = "none"
+    STATE.notification_alpha = 0
+    STATE.notification_window_shown = false
+
+    pcall(function()
+        if user32.IsWindow(hwnd) then
+            user32.ShowWindow(hwnd, WIN.SW_HIDE)
+            -- NOTE: We no longer DestroyWindow here to allow reuse
+        end
+    end)
+
+    STATE.notification_destroying = false
+    dbg("Notification hidden (kept for reuse)")
+end
+
+-- Ensure fonts are created (cached)
+local function ensure_fonts()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    -- Rebuild fonts if scale changed
+    if STATE.last_font_scale ~= CONFIG.notification_scale then
+        if STATE.cached_title_font then gdi32.DeleteObject(STATE.cached_title_font); STATE.cached_title_font = nil end
+        if STATE.cached_msg_font then gdi32.DeleteObject(STATE.cached_msg_font); STATE.cached_msg_font = nil end
+        STATE.last_font_scale = CONFIG.notification_scale
+    end
+
+    local scale_factor = CONFIG.notification_scale / 100.0
+
+    if STATE.cached_title_font == nil then
+        STATE.cached_title_font = gdi32.CreateFontA(
+            math.floor(-15 * scale_factor), 0, 0, 0, WIN.FW_BOLD, 0, 0, 0,
+            WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS,
+            WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI"
+        )
+    end
+    if STATE.cached_msg_font == nil then
+        STATE.cached_msg_font = gdi32.CreateFontA(
+            math.floor(-13 * scale_factor), 0, 0, 0, 400, 0, 0, 0,
+            WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS,
+            WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI"
+        )
+    end
+end
+
+-- Draw notification content to HDC
+local function draw_notification_to_hdc(hdc, hwnd)
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    if hdc == nil or hwnd == nil then return end
+
+    local rect = ffi.new("RECT")
+    user32.GetClientRect(hwnd, rect)
+
+    local bg_brush = gdi32.CreateSolidBrush(WIN.COLOR_BG)
+    if bg_brush ~= nil then
+        user32.FillRect(hdc, rect, bg_brush)
+        gdi32.DeleteObject(bg_brush)
+    end
+
+    local accent_brush = gdi32.CreateSolidBrush(WIN.COLOR_ACCENT)
+    if accent_brush ~= nil then
+        local accent_rect = ffi.new("RECT", {0, 0, 4, rect.bottom})
+        user32.FillRect(hdc, accent_rect, accent_brush)
+        gdi32.DeleteObject(accent_brush)
+    end
+
+    local scale_factor = CONFIG.notification_scale / 100.0
+
+    ensure_fonts()
+    if STATE.cached_title_font == nil then return end
+
+    local old_font = gdi32.SelectObject(hdc, STATE.cached_title_font)
+    gdi32.SetBkMode(hdc, WIN.TRANSPARENT)
+    gdi32.SetTextColor(hdc, WIN.COLOR_TEXT)
+
+    local safe_title = STATE.notification_title or "Notification"
+    if safe_title == "" then safe_title = "Notification" end
+
+    -- Scale drawing coordinates
+    local title_x = math.floor(12 * scale_factor)
+    local title_y = math.floor(10 * scale_factor)
+    local title_h = math.floor(30 * scale_factor)
+    
+    -- DT_CENTER (1) + DT_VCENTER (4) + DT_SINGLELINE (32) = 37
+    local text_flags = 37 
+    
+    local title_rect = ffi.new("RECT", {title_x, title_y, rect.right - math.floor(10 * scale_factor), title_y + title_h})
+    local title_wide = utf8_to_wide(safe_title)
+    if title_wide then
+        user32.DrawTextW(hdc, title_wide, -1, title_rect, text_flags)
+    else
+        user32.DrawTextA(hdc, safe_title, -1, title_rect, text_flags)
+    end
+
+    if STATE.cached_msg_font ~= nil then
+        gdi32.SelectObject(hdc, STATE.cached_msg_font)
+        gdi32.SetTextColor(hdc, 0x00BBBBBB)
+
+        local safe_message = STATE.notification_message or ""
+
+        local msg_y = math.floor(34 * scale_factor)
+        local msg_rect = ffi.new("RECT", {math.floor(12 * scale_factor), msg_y, rect.right - math.floor(10 * scale_factor), rect.bottom - math.floor(8 * scale_factor)})
+        local msg_wide = utf8_to_wide(safe_message)
+        if msg_wide then
+            user32.DrawTextW(hdc, msg_wide, -1, msg_rect, text_flags)
+        elseif safe_message ~= "" then
+            user32.DrawTextA(hdc, safe_message, -1, msg_rect, text_flags)
+        end
+    end
+
+    if old_font ~= nil then
+        gdi32.SelectObject(hdc, old_font)
+    end
+end
+
+-- Draw notification content (wrapper)
+local function draw_notification_content()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    if STATE.notification_hwnd == nil then return end
+
+    -- Enhanced safety: ensure we check if window still exists
+    if not user32.IsWindow(STATE.notification_hwnd) then
+        STATE.notification_hwnd = nil
+        return
+    end
+
+    local hdc = user32.GetDC(STATE.notification_hwnd)
+    if hdc ~= nil then
+        -- CRITICAL SAFETY: Ensure ReleaseDC is ALWAYS called even if drawing fails
+        -- to prevent GDI resource leaks.
+        pcall(draw_notification_to_hdc, hdc, STATE.notification_hwnd)
+        user32.ReleaseDC(STATE.notification_hwnd, hdc)
+    end
+end
+
+
+-- Register custom notification window class
+local function register_notification_class()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    if STATE.notification_class_atom ~= nil then
+        return true
+    end
+
+    local ok, result = pcall(function()
+        if STATE.notification_hinstance == nil then
+            STATE.notification_hinstance = kernel32.GetModuleHandleA(nil)
+        end
+
+        pcall(function()
+            user32.UnregisterClassA(NOTIF.NOTIFICATION_CLASS_NAME, STATE.notification_hinstance)
+        end)
+
+        -- CRASH FIX: Do not use a Lua callback for the Window Procedure.
+        -- We pass the Windows Default function directly. This prevents the
+        -- re-entrancy crash in lua51.dll.
+        STATE.notification_wndproc = user32.DefWindowProcA
+
+        if STATE.notification_bg_brush == nil then
+            STATE.notification_bg_brush = gdi32.CreateSolidBrush(WIN.COLOR_BG)
+        end
+
+        local wc = ffi.new("WNDCLASSEXA")
+        wc.cbSize = ffi.sizeof("WNDCLASSEXA")
+        wc.style = WIN.CS_HREDRAW + WIN.CS_VREDRAW
+        wc.lpfnWndProc = STATE.notification_wndproc -- Points to C function, not Lua
+        wc.cbClsExtra = 0
+        wc.cbWndExtra = 0
+        wc.hInstance = STATE.notification_hinstance
+        wc.hIcon = nil
+        wc.hCursor = nil
+        wc.hbrBackground = STATE.notification_bg_brush
+        wc.lpszMenuName = nil
+        wc.lpszClassName = NOTIF.NOTIFICATION_CLASS_NAME
+        wc.hIconSm = nil
+
+        STATE.notification_class_atom = user32.RegisterClassExA(wc)
+
+        if STATE.notification_class_atom == 0 then
+            dbg("Failed to register notification class")
+            if STATE.notification_bg_brush ~= nil then
+                gdi32.DeleteObject(STATE.notification_bg_brush)
+                STATE.notification_bg_brush = nil
+            end
+            return false
+        end
+
+        dbg("Registered custom notification class")
+        return true
+    end)
+
+    return ok and result or false
+end
+
+-- Unregister custom notification window class
+local function unregister_notification_class()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    if STATE.notification_wndproc ~= nil then
+        STATE.notification_wndproc = nil
+    end
+
+    if STATE.notification_class_atom ~= nil then
+        pcall(function()
+            user32.UnregisterClassA(NOTIF.NOTIFICATION_CLASS_NAME, STATE.notification_hinstance)
+        end)
+        STATE.notification_class_atom = nil
+    end
+
+    if STATE.notification_bg_brush ~= nil then
+        gdi32.DeleteObject(STATE.notification_bg_brush)
+        STATE.notification_bg_brush = nil
+    end
+
+    dbg("Unregistered notification class")
+end
+
+-- Animation timer callback
+local function notification_timer_callback()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then
+        STATE.notification_timer_should_stop = false
+        obs.timer_remove(notification_timer_callback)
+        return
+    end
+    if STATE.notification_timer_should_stop then
+        STATE.notification_timer_should_stop = false
+        obs.timer_remove(notification_timer_callback)
+        return
+    end
+
+    if STATE.notification_destroying then
+        return
+    end
+
+    local ok, err = pcall(function()
+        if STATE.notification_hwnd == nil or STATE.notification_destroying then
+            STATE.notification_timer_should_stop = true
+            STATE.notification_fade_state = "none"
+            return
+        end
+
+        local need_redraw = false
+
+        if STATE.notification_fade_state == "in" then
+            STATE.notification_alpha = STATE.notification_alpha + NOTIF.FADE_STEP
+            if STATE.notification_alpha >= NOTIF.FADE_MAX_ALPHA then
+                STATE.notification_alpha = NOTIF.FADE_MAX_ALPHA
+                STATE.notification_fade_state = "visible"
+                -- Only redraw once when fully visible
+                need_redraw = true
+            else
+                -- Redraw while fading in to update alpha
+                need_redraw = true
+            end
+
+            user32.SetLayeredWindowAttributes(STATE.notification_hwnd, 0, STATE.notification_alpha, WIN.LWA_ALPHA)
+
+            if not STATE.notification_window_shown then
+                user32.ShowWindow(STATE.notification_hwnd, WIN.SW_SHOWNOACTIVATE)
+                -- Win11 FIX: Force TOPMOST re-assertion after ShowWindow
+                -- Windows 11 can strip TOPMOST from layered windows during show
+                if WIN.HWND_TOPMOST then
+                    user32.SetWindowPos(STATE.notification_hwnd, WIN.HWND_TOPMOST, 0, 0, 0, 0, WIN.SWP_NOSIZE + WIN.SWP_NOMOVE + WIN.SWP_NOACTIVATE)
+                end
+                STATE.notification_window_shown = true
+            end
+
+        elseif STATE.notification_fade_state == "visible" then
+            if os.time() >= STATE.notification_end_time then
+                STATE.notification_fade_state = "out"
+            end
+            -- Efficiency: No redraw needed while static
+
+        elseif STATE.notification_fade_state == "out" then
+            STATE.notification_alpha = STATE.notification_alpha - NOTIF.FADE_STEP
+            if STATE.notification_alpha <= 0 then
+                STATE.notification_alpha = 0
+                hide_notification()
+                STATE.notification_timer_should_stop = true
+                dbg("Notification fade-out complete")
+                return
+            end
+            user32.SetLayeredWindowAttributes(STATE.notification_hwnd, 0, STATE.notification_alpha, WIN.LWA_ALPHA)
+            -- Efficiency: Windows handles alpha transparency on its own,
+            -- we don't need to re-render the bitmap itself.
+            need_redraw = false
+        end
+
+        -- CRASH FIX: Manually draw content from the timer thread
+        -- This is safe because it is sequential, not interrupt-driven
+        if need_redraw and STATE.notification_hwnd ~= nil then
+            draw_notification_content()
+        end
+    end)
+
+    if not ok then
+        dbg("Timer callback error: " .. tostring(err))
+        hide_notification()
+        STATE.notification_timer_should_stop = true
+    end
+end
+
+-- Calculate notification position based on user setting
+local function get_notification_position(scale_factor)
+    local scaled_width = math.floor(NOTIF.NOTIFICATION_WIDTH * scale_factor)
+    local scaled_height = math.floor(NOTIF.NOTIFICATION_HEIGHT * scale_factor)
+    local scaled_margin = math.floor(NOTIF.NOTIFICATION_MARGIN * scale_factor)
+
+    local screen_width = user32.GetSystemMetrics(WIN.SM_CXSCREEN)
+    local screen_height = user32.GetSystemMetrics(WIN.SM_CYSCREEN)
+
+    local pos = CONFIG.notification_position or "top_right"
+    local x, y
+
+    if pos == "top_left" then
+        x = scaled_margin
+        y = scaled_margin
+    elseif pos == "bottom_right" then
+        x = screen_width - scaled_width - scaled_margin
+        y = screen_height - scaled_height - scaled_margin
+    elseif pos == "bottom_left" then
+        x = scaled_margin
+        y = screen_height - scaled_height - scaled_margin
+    else -- top_right (default)
+        x = screen_width - scaled_width - scaled_margin
+        y = scaled_margin
+    end
+
+    return x, y, scaled_width, scaled_height
+end
+
+-- Show notification popup
+local function show_notification(title, message)
+    -- Respect the "Show visual popup" toggle. Gates BOTH the Win32 popup and the
+    -- Linux notify-send path below. Sound is gated separately by CONFIG.play_sound.
+    if not CONFIG.show_notifications then return end
+
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then
+        if not IS_WINDOWS and command_exists("notify-send") then
+            local timeout_ms = math.max(1000, math.floor((CONFIG.notification_duration or 3.0) * 1000))
+            local cmd = string.format(
+                "notify-send -a %s -t %d %s %s >/dev/null 2>&1 &",
+                quote_shell_arg("Smart Replay Mover"),
+                timeout_ms,
+                quote_shell_arg(title or "Notification"),
+                quote_shell_arg(message or "")
+            )
+            run_shell_command(cmd)
+            dbg("Linux notification triggered: " .. tostring(title) .. " | " .. tostring(message))
+        end
+        return
+    end
+
+    if is_exclusive_fullscreen() then
+        dbg("Exclusive fullscreen detected - skipping popup")
+        return
+    end
+
+    -- STABILITY FIX: Instead of always destroying the window, we reuse it.
+    -- This avoids the risky DestroyWindow/CreateWindow cycle during stress periods.
+    STATE.notification_title = title or "Notification"
+    STATE.notification_message = message or ""
+    STATE.notification_end_time = os.time() + math.ceil(CONFIG.notification_duration)
+    STATE.notification_alpha = 0
+    STATE.notification_fade_state = "in"
+    STATE.notification_window_shown = false
+
+    local ok, err = pcall(function()
+        if STATE.notification_hinstance == nil then
+            STATE.notification_hinstance = kernel32.GetModuleHandleA(nil)
+        end
+
+        if not register_notification_class() then
+            dbg("Failed to register notification class, cannot show popup")
+            return
+        end
+
+        -- Check if window still exists and is valid
+        local needs_create = true
+        if STATE.notification_hwnd ~= nil then
+            if user32.IsWindow(STATE.notification_hwnd) then
+                needs_create = false
+            else
+                STATE.notification_hwnd = nil -- Invalid handle
+            end
+        end
+
+        if needs_create then
+            destroy_orphaned_notifications()
+
+            local scale_factor = CONFIG.notification_scale / 100.0
+            local x, y, scaled_width, scaled_height = get_notification_position(scale_factor)
+
+            local ex_style = WIN.WS_EX_TOPMOST + WIN.WS_EX_TOOLWINDOW + WIN.WS_EX_NOACTIVATE + WIN.WS_EX_LAYERED + WIN.WS_EX_TRANSPARENT
+
+            STATE.notification_hwnd = user32.CreateWindowExA(
+                ex_style,
+                NOTIF.NOTIFICATION_CLASS_NAME,
+                NOTIF.NOTIFICATION_WINDOW_TITLE,
+                WIN.WS_POPUP,
+                x, y,
+                scaled_width, scaled_height,
+                nil, nil,
+                STATE.notification_hinstance,
+                nil
+            )
+
+            if STATE.notification_hwnd == nil then
+                dbg("CreateWindowExA failed")
+                return
+            end
+            dbg("New notification window created (Reuse initialized) at scale " .. CONFIG.notification_scale .. "%")
+        else
+            -- If scale changes but window is reused, we might need to recreate it. 
+            -- But for now, we assume users won't change scale mid-session often. 
+            -- To be safe, we could destroy and recreate if size differs, but reuse is prioritized for stability.
+            -- If needed, user can reload script to force resize.
+            dbg("Reusing existing notification window")
+            
+            -- Optional: Position update if resolution changed or scale changed
+            local scale_factor = CONFIG.notification_scale / 100.0
+            local x, y, scaled_width, scaled_height = get_notification_position(scale_factor)
+            
+            -- Win11 FIX: Use HWND_TOPMOST to re-assert topmost status on reuse
+            -- Previously used SWP_NOZORDER which prevented Z-order update
+            local insert_after = WIN.HWND_TOPMOST or nil
+            user32.SetWindowPos(STATE.notification_hwnd, insert_after, x, y, scaled_width, scaled_height, WIN.SWP_NOACTIVATE)
+        end
+
+        user32.SetLayeredWindowAttributes(STATE.notification_hwnd, 0, 0, WIN.LWA_ALPHA)
+
+        -- Initial manual draw to set the new content
+        draw_notification_content()
+
+        -- Restart/Update timer
+        obs.timer_remove(notification_timer_callback)
+        obs.timer_add(notification_timer_callback, NOTIF.FADE_INTERVAL)
+
+        dbg("Notification triggered: " .. title .. " | " .. message)
+    end)
+
+    if not ok then
+        dbg("Failed to show notification: " .. tostring(err))
+    end
+end
+
+-- Resolves CONFIG.notification_sound to a path relative to SCRIPT_DIR.
+local function resolve_notification_sound_file()
+    local choice = CONFIG.notification_sound
+    if not choice or choice == "" or choice == "default" then
+        return "notification_sound.wav"
+    end
+    if choice == "quiet" then
+        return "notification_sound_silent.wav"
+    end
+    if choice == "random" then
+        local pool = STATE.notification_sounds or {}
+        if #pool > 0 then
+            if not STATE.rng_seeded then math.randomseed(os.time()); STATE.rng_seeded = true end
+            return "sounds/" .. pool[math.random(#pool)]
+        end
+        return "notification_sound.wav"   -- empty sounds/ folder: fall back to default
+    end
+    return "sounds/" .. choice   -- a specific file picked from the sounds/ folder
+end
+
+-- Play notification sound
+local function play_notification_sound()
+    if not CONFIG.play_sound then return end
+
+    if not WINDOWS_FFI_AVAILABLE then
+        if SCRIPT_DIR and SCRIPT_DIR ~= "" then
+            local sound_file = resolve_notification_sound_file()
+            local full_path = SCRIPT_DIR .. sound_file
+            if obs.os_file_exists(full_path) then
+                if command_exists("paplay") then
+                    run_shell_command("paplay " .. quote_shell_arg(full_path) .. " >/dev/null 2>&1 &")
+                    dbg("Playing Linux notification sound via paplay: " .. sound_file)
+                    return
+                end
+                if command_exists("pw-play") then
+                    run_shell_command("pw-play " .. quote_shell_arg(full_path) .. " >/dev/null 2>&1 &")
+                    dbg("Playing Linux notification sound via pw-play: " .. sound_file)
+                    return
+                end
+            end
+        end
+        return
+    end
+    if winmm == nil then return end
+
+    pcall(function()
+        if SCRIPT_DIR and SCRIPT_DIR ~= "" then
+            local sound_file = resolve_notification_sound_file()
+            
+            local full_path = SCRIPT_DIR .. sound_file
+            local result = winmm.PlaySoundA(full_path, nil, WIN.SND_FILENAME + WIN.SND_ASYNC + WIN.SND_NODEFAULT)
+            if result ~= 0 then
+                dbg("Playing custom sound: " .. sound_file)
+                return
+            end
+        end
+
+        winmm.PlaySoundA("SystemNotification", nil, WIN.SND_ALIAS + WIN.SND_ASYNC)
+        dbg("Playing system notification sound")
+    end)
+end
+
+-- ============================================================================
+-- THREAD-SAFE NOTIFICATION QUEUE
+-- ============================================================================
+-- PROBLEM: notify() is called from multiple threads:
+--   - Hotkey callbacks  → OBS hotkey thread
+--   - on_event()        → OBS UI/main thread
+--   - Timer callbacks   → OBS graphics thread
+-- Win32 windows MUST be created and manipulated from the SAME thread.
+-- Cross-thread Win32 operations cause undefined behavior (hangs/deadlocks).
+--
+-- SOLUTION: notify() just pushes a message into a Lua table (queue).
+-- process_notification_queue() is the ONLY function that calls show_notification()
+-- and play_notification_sound(). It runs exclusively on the graphics thread via
+-- a dedicated obs.timer_add, ensuring all GDI/Win32 calls are on one thread.
+-- ============================================================================
+
+local notification_queue = {}
+
+-- Thread-safe: safe to call from hotkey thread, UI thread, or graphics thread.
+-- Does NO Win32/GDI work — only inserts into a Lua table.
+local function notify(title, message)
+    table.insert(notification_queue, { title = title, message = message })
+end
+
+-- Runs on the graphics thread every 50ms via obs.timer_add in script_load.
+-- This is the SOLE consumer of notification_queue.
+local function process_notification_queue()
+    if #notification_queue == 0 then return end
+
+    local notif = table.remove(notification_queue, 1)
+
+    if CONFIG.single_notification then
+        -- Single-notification mode: a replay save shows only "Saving...".
+        -- Drop the replay follow-ups; screenshots/recordings/test are left alone.
+        if notif.title == "Clip Saved" or notif.title == "Move Failed" then
+            return
+        end
+    elseif notif.title == "Saving..." and #notification_queue > 0 then
+        -- Fast systems (NVMe/SSD): skip "Saving..." when the result is already queued.
+        notif = table.remove(notification_queue, 1)
+    end
+
+    -- Sound plays once per replay: on "Saving...", or on the result when there was no
+    -- "Saving..." (or it was fast-skipped). The follow-up "Clip Saved"/"Move Failed"
+    -- then stays silent, so a single save beeps a single time.
+    local play_sound = true
+    if notif.title == "Saving..." then
+        STATE.replay_beeped = true
+    elseif notif.title == "Clip Saved" or notif.title == "Move Failed" then
+        play_sound = not STATE.replay_beeped
+        STATE.replay_beeped = false
+    end
+    if play_sound then play_notification_sound() end
+    show_notification(notif.title, notif.message)
+end
+
+-- Cleanup notification resources
+local function cleanup_notifications()
+    if not VISUAL_NOTIFICATIONS_SUPPORTED then return end
+    STATE.notification_timer_should_stop = true
+    obs.timer_remove(notification_timer_callback)
+
+    hide_notification()
+
+    if STATE.cached_title_font ~= nil then
+        gdi32.DeleteObject(STATE.cached_title_font)
+        STATE.cached_title_font = nil
+    end
+    if STATE.cached_msg_font ~= nil then
+        gdi32.DeleteObject(STATE.cached_msg_font)
+        STATE.cached_msg_font = nil
+    end
+
+    destroy_orphaned_notifications()
+
+    unregister_notification_class()
+
+    STATE.notification_hinstance = nil
+    STATE.notification_destroying = false
+    STATE.notification_timer_should_stop = false
+    STATE.notification_fade_state = "none"
+    STATE.notification_alpha = 0
+    STATE.notification_window_shown = false
+    STATE.notification_end_time = 0
+    STATE.notification_title = ""
+    STATE.notification_message = ""
+    STATE.notification_hwnd = nil  -- Explicitly reset handle
+end
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- Check if handle is invalid (INVALID_HANDLE_VALUE = -1)
+local function is_invalid_handle(handle)
+    if handle == nil then return true end
+    local handle_val = tonumber(ffi.cast("intptr_t", handle))
+    return handle_val == -1 or handle_val == 0
+end
+
+local function clean_filename(str)
+    if not str or str == "" then return "Unknown" end
+    str = string.gsub(str, '[<>:"/\\|?*]', "")
+    str = string.gsub(str, "^%s+", "")
+    str = string.gsub(str, "%s+$", "")
+    if str == "" then return "Unknown" end
+    return str
+end
+
+local function clean_folder_path(str)
+    if not str or str == "" then return "Unknown" end
+    -- Allow / and \ for nested folders, but sanitize specific chars
+    str = string.gsub(str, '[<>:"|?*]', "")
+    -- Remove directory traversal attempts
+    str = string.gsub(str, "%.%.", "")
+    -- Normalize slashes
+    str = string.gsub(str, "\\", "/")
+    -- Clean whitespace
+    str = string.gsub(str, "^%s+", "")
+    str = string.gsub(str, "%s+$", "")
+    if str == "" then return "Unknown" end
+    return str
+end
+
+-- Values for the {type} token; the folder names live here only.
+local MEDIA = {
+    REPLAY = "Replays",
+    RECORDING = "Recordings",
+    SCREENSHOT = "Screenshots",
+}
+
+-- Expand {token} placeholders (case-insensitive).
+-- An unknown media type resolves {type} to "", and sanitize_relative_path then
+-- drops the empty segment, so the file lands in the game folder as before.
+local function apply_folder_template(template, game, media_type)
+    local t = {
+        game = game or "",
+        type = media_type or "",
+        year = os.date("%Y"), month = os.date("%m"), day = os.date("%d"),
+        date = os.date("%Y-%m-%d"), yearmonth = os.date("%Y-%m"),
+        hour = os.date("%H"), min = os.date("%M"),
+    }
+    return (template:gsub("{(%w+)}", function(k)
+        local v = t[k:lower()]
+        return v ~= nil and v or ("{" .. k .. "}")
+    end))
+end
+
+-- Force a template to a relative path that stays inside the output folder.
+local function sanitize_relative_path(str)
+    local segments = {}
+    for seg in clean_folder_path(str):gmatch("[^/]+") do
+        local s = seg:gsub("^%s+", ""):gsub("%s+$", "")
+        if s ~= "" and s ~= "." and s ~= ".." then
+            segments[#segments + 1] = s
+        end
+    end
+    return table.concat(segments, "/")
+end
+
+-- Recursive mkdir; keeps the root intact for UNC (//server), drive letters (C:) and absolute paths.
+local function recursive_mkdir(path)
+    path = string.gsub(path, "\\", "/")
+    local current = ""
+
+    -- Preserve the root: UNC "//server" before the single-slash absolute case
+    if string.sub(path, 1, 2) == "//" then
+        current = "//"
+    elseif string.sub(path, 1, 1) == "/" then
+        current = "/"
+    end
+
+    for part in string.gmatch(path, "[^/]+") do
+        -- Skip drive letter segment if already captured as root
+        if string.match(part, "^%a:$") and current == "" then
+            current = part
+        else
+            if current == "" or current == "/" or current == "//" then
+                current = current .. part
+            else
+                current = current .. "/" .. part
+            end
+        end
+
+        if not obs.os_file_exists(current) then
+            obs.os_mkdir(current)
+        end
+    end
+    return obs.os_file_exists(path)
+end
+
+-- Truncate filename to fit within MAX_PATH limit
+local function truncate_filename(filename, max_len)
+    if not filename or #filename <= max_len then
+        return filename
+    end
+
+    local name, ext = string.match(filename, "^(.+)(%.%w+)$")
+    if not name then
+        name = filename
+        ext = ""
+    end
+
+    local keep_len = max_len - 3 - #ext
+    if keep_len < 10 then
+        keep_len = 10
+    end
+
+    return utf8_truncate(name, keep_len) .. "..." .. ext
+end
+
+-- Validate path length
+local function validate_path_length(path)
+    if not path then return false, "Path is nil" end
+    if #path > WIN.MAX_PATH then
+        return false, "Path exceeds MAX_PATH (" .. WIN.MAX_PATH .. "): " .. #path .. " chars"
+    end
+    return true, nil
+end
+
+local function is_ignored(name)
+    if not name or name == "" then return true end
+    local lower = string.lower(name)
+    -- Exact match via hash set (O(1)) — no false positives
+    -- e.g. "obs" won't match "observer", "code" won't match "barcode"
+    return IGNORE_SET[lower] == true
+end
+
+-- ============================================================================
+-- GET GAME FOLDER (Main detection logic with priorities)
+-- ============================================================================
+
+local function get_game_folder(raw_name, window_title, skip_window_fallback)
+    -- ═══════════════════════════════════════════════════════════════
+    -- PRIORITY 1: Custom names (ABSOLUTE - user-defined ALWAYS wins!)
+    -- This is the HIGHEST priority - users can override ANY detection
+    -- ═══════════════════════════════════════════════════════════════
+    local custom = get_custom_name(raw_name, window_title)
+    if custom then
+        dbg("CUSTOM NAME OVERRIDE: " .. tostring(raw_name) .. " / " .. tostring(window_title) .. " -> " .. custom)
+        return custom
+    end
+
+    -- If process name available, try to match it
+    if raw_name and raw_name ~= "" then
+        local lower = string.lower(raw_name)
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- PRIORITY 2: GAME_NAMES (quick exact matches)
+        -- ═══════════════════════════════════════════════════════════════
+        if GAME_NAMES[lower] then
+            dbg("GAME_NAMES match: " .. lower .. " -> " .. GAME_NAMES[lower])
+            return GAME_NAMES[lower]
+        end
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- PRIORITY 3: GAME_DATABASE (1876 games embedded)
+        -- Direct access - no lazy loading needed anymore
+        -- ═══════════════════════════════════════════════════════════════
+        if GAME_DATABASE and GAME_DATABASE[lower] then
+            dbg("GAME_DATABASE match: " .. lower .. " -> " .. GAME_DATABASE[lower])
+            return GAME_DATABASE[lower]
+        end
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- PRIORITY 4: GAME_PATTERNS (keyword matching)
+        -- ═══════════════════════════════════════════════════════════════
+        for _, pattern in ipairs(GAME_PATTERNS) do
+            if string.find(lower, pattern[1], 1, true) then
+                dbg("GAME_PATTERNS match: " .. lower .. " -> " .. pattern[2])
+                return pattern[2]
+            end
+        end
+
+        -- Use raw name if no pattern match (clean it for folder name)
+        return clean_filename(raw_name)
+    end
+
+    -- If skip_window_fallback is true, process was ignored (Explorer, Discord, etc.)
+    -- Go straight to fallback
+    if skip_window_fallback then
+        dbg("Process was ignored, skipping window title fallback")
+        return CONFIG.fallback_folder
+    end
+
+    -- ═══════════════════════════════════════════════════════════════
+    -- FALLBACK: Process name unavailable (anti-cheat blocked it)
+    -- Try to detect game from window title - BUT ONLY known games!
+    -- ═══════════════════════════════════════════════════════════════
+    if window_title and window_title ~= "" then
+        dbg("Process unavailable, checking window title: " .. window_title)
+        local lower_title = string.lower(window_title)
+
+        -- SAFETY CHECK: Skip if window title looks like a file explorer
+        if string.find(lower_title, ":\\", 1, true) or
+           string.find(lower_title, ":/", 1, true) or
+           string.find(lower_title, "file explorer", 1, true) or
+           string.find(lower_title, "explorer", 1, true) then
+            dbg("Window title looks like file explorer, using fallback")
+            return CONFIG.fallback_folder
+        end
+
+        -- Check if window title contains any ignored program name
+        for _, ignored in ipairs(IGNORE_LIST) do
+            if string.find(lower_title, ignored, 1, true) then
+                dbg("Window title contains ignored program: " .. ignored)
+                return CONFIG.fallback_folder
+            end
+        end
+
+        -- Check patterns against window title
+        for _, pattern in ipairs(GAME_PATTERNS) do
+            if string.find(lower_title, pattern[1], 1, true) then
+                dbg("Window title matched GAME_PATTERNS: " .. pattern[2])
+                return pattern[2]
+            end
+        end
+
+        -- Check exact game names
+        for process, folder in pairs(GAME_NAMES) do
+            if string.find(lower_title, process, 1, true) then
+                dbg("Window title matched GAME_NAMES: " .. folder)
+                return folder
+            end
+        end
+
+        -- Check database by window title (slower but comprehensive)
+        if GAME_DATABASE then
+            for process, folder in pairs(GAME_DATABASE) do
+                if string.find(lower_title, process, 1, true) then
+                    dbg("Window title matched GAME_DATABASE: " .. folder)
+                    return folder
+                end
+            end
+        end
+
+        dbg("Window title didn't match any known game, using fallback")
+    end
+
+    -- Final fallback
+    local result = CONFIG.fallback_folder
+    if not result or result == "" then
+        result = "Desktop"
+    end
+    return result
+end
+
+
+-- ============================================================================
+-- GAME DETECTION
+-- ============================================================================
+
+local function get_active_process()
+    if not WINDOWS_FFI_AVAILABLE then return nil end
+    local ok, result = pcall(function()
+        local hwnd = user32.GetForegroundWindow()
+        if not hwnd then return nil end
+
+        local pid = ffi.new("DWORD[1]")
+        user32.GetWindowThreadProcessId(hwnd, pid)
+
+        -- Validate PID before proceeding
+        if pid[0] == 0 then return nil end
+
+        local process = kernel32.OpenProcess(WIN.PROCESS_QUERY_INFORMATION + WIN.PROCESS_VM_READ, 0, pid[0])
+        if is_invalid_handle(process) then return nil end
+
+        -- Wide (UTF-16) buffer + GetModuleBaseNameW: no code page involved, so
+        -- process names in ANY language come through intact. Nested pcall because
+        -- some anti-cheat systems (Marvel Rivals, Valorant, etc.) can crash here.
+        local wbuffer = ffi.new("unsigned short[260]")
+        local get_ok, len = pcall(function()
+            return psapi.GetModuleBaseNameW(process, nil, wbuffer, 260)
+        end)
+        
+        -- Safe close for first attempt
+        kernel32.CloseHandle(process)
+
+        if get_ok and len and len > 0 then
+            -- Safely extract string with explicit length limit
+            if len > 259 then len = 259 end
+            local name = wide_to_utf8(wbuffer, len)
+            if name and name ~= "" then
+                return string.gsub(name, "%.[eE][xX][eE]$", "")
+            end
+        end
+        
+        -- FALLBACK: Try QueryFullProcessImageNameW with PROCESS_QUERY_LIMITED_INFORMATION
+        -- This is needed for games with stricter anti-cheat (ARC Raiders, THE FINALS, etc.)
+        -- that block PROCESS_VM_READ
+        
+        local process_fallback = kernel32.OpenProcess(WIN.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid[0])
+        if is_invalid_handle(process_fallback) then return nil end
+        
+        local fallback_ok, fallback_result = pcall(function()
+            local size = ffi.new("DWORD[1]", 260)
+            local res = kernel32.QueryFullProcessImageNameW(process_fallback, 0, wbuffer, size)
+            if res ~= 0 and size[0] > 0 then
+                local full_path = wide_to_utf8(wbuffer, size[0])
+                if not full_path then return nil end
+                -- Extract filename from full path
+                local name = string.match(full_path, "([^/\\]+)$") or full_path
+                return string.gsub(name, "%.[eE][xX][eE]$", "")
+            end
+            return nil
+        end)
+        
+        kernel32.CloseHandle(process_fallback)
+        
+        return fallback_ok and fallback_result or nil
+    end)
+
+    return ok and result or nil
+end
+
+local function get_window_title()
+    if not WINDOWS_FFI_AVAILABLE then return nil end
+    local ok, result = pcall(function()
+        local hwnd = user32.GetForegroundWindow()
+        if not hwnd then return nil end
+
+        local wide_buffer = ffi.new("unsigned short[512]")
+
+        local get_ok, len = pcall(function()
+            return user32.GetWindowTextW(hwnd, wide_buffer, 512)
+        end)
+
+        if not get_ok or not len or len <= 0 then
+            return nil
+        end
+
+        if len > 500 then len = 500 end
+
+        return wide_to_utf8(wide_buffer, len)
+    end)
+
+    return ok and result or nil
+end
+
+
+local normalize_detected_process_name
+
+function is_generic_steam_app_identifier(value)
+    if not value or value == "" then return false end
+    local lower = string.lower(tostring(value))
+    local base = lower:gsub("%.desktop$", "")
+    return string.match(base, "^steam_app_%d+$") ~= nil
+end
+
+function get_active_x11_window_info()
+    if IS_WINDOWS or not os.getenv("DISPLAY") or not command_exists("xprop") then return nil, nil end
+    local root = capture_command_output("xprop -root _NET_ACTIVE_WINDOW")
+    if not root then return nil, nil end
+    local window_id = string.match(root, "window id # (0x%x+)")
+    if not window_id or window_id == "0x0" then return nil, nil end
+    local props = capture_command_output("xprop -id " .. window_id .. " WM_CLASS _NET_WM_NAME WM_NAME")
+    if not props then return nil, nil end
+    local title = string.match(props, '_NET_WM_NAME%([^%)]*%) = "([^"]+)"') or string.match(props, 'WM_NAME%([^%)]*%) = "([^"]+)"')
+    local class_a, class_b = string.match(props, 'WM_CLASS%([^%)]*%) = "([^"]+)", "([^"]+)"')
+    local process = normalize_detected_process_name(class_b) or normalize_detected_process_name(class_a)
+    return process, title
+end
+
+function get_active_linux_window_info()
+    local process, title = get_active_x11_window_info()
+    if process or title then return process, title end
+    return nil, nil
+end
+
+normalize_detected_process_name = function(value)
+    if not value or value == "" then return nil end
+    local cleaned = tostring(value)
+    cleaned = string.gsub(cleaned, "^%s+", "")
+    cleaned = string.gsub(cleaned, "%s+$", "")
+    if cleaned == "" then return nil end
+    cleaned = string.match(cleaned, "([^/\\]+)$") or cleaned
+    cleaned = string.gsub(cleaned, "%.[eE][xX][eE]$", "")
+    cleaned = string.gsub(cleaned, "%.[Aa][Pp][Pp][Ii][Mm][Aa][Gg][Ee]$", "")
+    return cleaned
+end
+
+function get_obs_window_candidate(window_value)
+    if not window_value or window_value == "" then return nil end
+    local last_segment = nil
+    for segment in string.gmatch(window_value, "[^:]+") do last_segment = segment end
+    if not last_segment or last_segment == "" then last_segment = window_value end
+    return normalize_detected_process_name(last_segment)
+end
+
+function get_obs_window_value(settings)
+    if not settings then return nil end
+    local keys = { "window", "title", "window_name" }
+    for _, key in ipairs(keys) do
+        local value = obs.obs_data_get_string(settings, key)
+        if value and value ~= "" then return value, key end
+    end
+    return nil
+end
+
+function get_obs_process_candidate(window_value)
+    if not window_value or window_value == "" then return nil end
+    local lower = string.lower(window_value)
+    if string.find(lower, "/", 1, true) or string.find(lower, "\\", 1, true) or string.find(lower, ".exe", 1, true) or string.find(lower, ".appimage", 1, true) then
+        return get_obs_window_candidate(window_value)
+    end
+    return nil
+end
+
+function is_portable_obs_source(source_id)
+    if not source_id or source_id == "" then return false end
+    local types = {game_capture=true, window_capture=true, xcomposite_input=true, ["pipewire-window-capture-source"]=true, ["pipewire-desktop-capture-source"]=true, screen_capture=true, xshm_input=true}
+    return types[source_id] or false
+end
+
+local function find_game_in_obs()
+    local ok, result, result_window = pcall(function()
+        local sources = obs.obs_enum_sources()
+        if not sources then return nil end
+        local found = nil
+        local found_window = nil
+        for _, source in ipairs(sources) do
+            local id = obs.obs_source_get_id(source)
+            local portable = not WINDOWS_FFI_AVAILABLE and is_portable_obs_source(id)
+            if id == "game_capture" or portable then
+                -- LIVENESS CHECK: Only trust source settings if the source is actively
+                -- capturing something. When no game is hooked, width/height = 0.
+                -- This prevents returning stale data from previously captured games.
+                -- (Cross-platform: works on both Windows and Linux)
+                local source_width = obs.obs_source_get_width(source)
+                if source_width == 0 then
+                    dbg("find_game_in_obs: source '" .. (obs.obs_source_get_name(source) or "?") .. "' not active (width=0), skipping")
+                    goto continue_source
+                end
+
+                local settings = obs.obs_source_get_settings(source)
+                if settings then
+                    local window = obs.obs_data_get_string(settings, "window")
+                    if not window or window == "" then window = obs.obs_data_get_string(settings, "title") end
+                    
+                    if window and window ~= "" then
+                        if not found_window then found_window = window end
+                        local exe = get_obs_process_candidate(window)
+                        if exe and not is_ignored(exe) then
+                            found = exe
+                            obs.obs_data_release(settings)
+                            break
+                        end
+                    end
+                    obs.obs_data_release(settings)
+                end
+
+                -- FALLBACK: Try get_hooked proc handler (Windows game_capture only)
+                -- This queries the live hooked process, not stale settings
+                if not found and id == "game_capture" then
+                    local proc_handler = obs.obs_source_get_proc_handler(source)
+                    if proc_handler then
+                        local cd = obs.calldata_create()
+                        if cd then
+                            local call_ok = pcall(function()
+                                if obs.proc_handler_call(proc_handler, "get_hooked", cd) then
+                                    local hooked = obs.calldata_string(cd, "hooked_exe")
+                                    if hooked and hooked ~= "" then
+                                        local hooked_clean = string.gsub(hooked, "%.[eE][xX][eE]$", "")
+                                        if not is_ignored(hooked_clean) then
+                                            found = hooked_clean
+                                            dbg("Found game from hooked process: " .. found)
+                                        end
+                                    end
+                                end
+                            end)
+                            obs.calldata_destroy(cd)
+                        end
+                    end
+                end
+
+                if found then break end
+            end
+            ::continue_source::
+        end
+        obs.source_list_release(sources)
+        return found, found_window
+    end)
+    if not ok then return nil, nil end
+    return result, result_window
+end
+
+local function get_background_game()
+    if not WINDOWS_FFI_AVAILABLE then return nil end
+    local ok, result = pcall(function()
+        local snapshot = kernel32.CreateToolhelp32Snapshot(WIN.TH32CS_SNAPPROCESS, 0)
+        if is_invalid_handle(snapshot) then return nil end
+
+        local pe32 = ffi.new("PROCESSENTRY32")
+        pe32.dwSize = ffi.sizeof("PROCESSENTRY32")
+
+        if kernel32.Process32First(snapshot, pe32) == 0 then
+            kernel32.CloseHandle(snapshot)
+            return nil
+        end
+
+        repeat
+            local exe_file = ffi.string(pe32.szExeFile)
+            local name = string.gsub(exe_file, "%.[eE][xX][eE]$", ""):lower()
+            
+            if not is_ignored(name) and ((CUSTOM_NAMES_EXACT and CUSTOM_NAMES_EXACT[name])
+                or (GAME_NAMES and GAME_NAMES[name])
+                or (GAME_DATABASE and GAME_DATABASE[name])) then
+                dbg("Background game found via process snapshot: " .. name)
+                kernel32.CloseHandle(snapshot)
+                return name
+            end
+        until kernel32.Process32Next(snapshot, pe32) == 0
+
+        kernel32.CloseHandle(snapshot)
+        return nil
+    end)
+    if not ok then dbg("get_background_game ERROR: " .. tostring(result)) end
+    return ok and result or nil
+end
+
+-- Detect active game
+-- Returns: process_or_game_name, window_title, skip_window_fallback
+local function detect_game()
+    if not WINDOWS_FFI_AVAILABLE then
+        local linux_process, linux_title = get_active_linux_window_info()
+        if linux_process and is_ignored(linux_process) then return nil, linux_title, true end
+        -- Proton/Steam wrapper: the process is a generic steam_app_<AppID>, so the real
+        -- game name lives in the window title (KWin caption / _NET_WM_NAME).
+        if is_generic_steam_app_identifier(linux_process) and linux_title and linux_title ~= "" then
+            dbg("Generic Steam AppID '" .. tostring(linux_process) .. "' -> using window title: " .. linux_title)
+            return linux_title, linux_title, false
+        end
+        if linux_process or linux_title then return linux_process, linux_title, false end
+        
+        local obs_game, obs_window = find_game_in_obs()
+        if obs_game and not is_ignored(obs_game) then return obs_game, obs_window, false end
+        if obs_window and obs_window ~= "" then return nil, obs_window, false end
+        return nil, nil, false
+    end
+
+    local process = get_active_process()
+    local title = get_window_title()
+    local window_title_for_matching = title
+    local active_ignored = false
+
+    if process and is_ignored(process) then
+        active_ignored = true
+    end
+
+    -- Proton/Steam wrapper (defensive on Windows): the process is a generic
+    -- steam_app_<AppID>, so prefer the window title, which holds the real game.
+    if process and is_generic_steam_app_identifier(process)
+       and window_title_for_matching and window_title_for_matching ~= "" then
+        dbg("Generic Steam AppID '" .. tostring(process) .. "' -> using window title: " .. window_title_for_matching)
+        return window_title_for_matching, window_title_for_matching, false
+    end
+
+    if process and not active_ignored then
+        return process, window_title_for_matching, false
+    end
+
+    local obs_game = find_game_in_obs()
+    if obs_game and not is_ignored(obs_game) then
+        return obs_game, window_title_for_matching, false
+    end
+
+    if WINDOWS_FFI_AVAILABLE and CONFIG.scan_all_processes then
+        local bg_game = get_background_game()
+        if bg_game then return bg_game, window_title_for_matching, false end
+    end
+
+    if active_ignored then return nil, window_title_for_matching, true end
+    return nil, window_title_for_matching, false
+end
+
+-- ============================================================================
+-- FILE OPERATIONS
+-- ============================================================================
+
+local function get_existing_folder(root, name)
+    if not WINDOWS_FFI_AVAILABLE then return name end
+    local ok, result = pcall(function()
+        local search = root .. "/" .. name
+        search = string.gsub(search, "/", "\\")
+
+        -- FindFirstFileW takes a UTF-16 path -> lossless for any language.
+        local wsearch = utf8_to_wide(search)
+        if not wsearch then return name end
+
+        local data = ffi.new("WIN32_FIND_DATAW")
+        local handle = kernel32.FindFirstFileW(wsearch, data)
+
+        if not is_invalid_handle(handle) then
+            -- cFileName is UTF-16; measure it, then convert to UTF-8.
+            local real = wide_to_utf8(data.cFileName, wide_strlen(data.cFileName, 260))
+            kernel32.FindClose(handle)
+            if real and real ~= "." and real ~= ".." then
+                return real
+            end
+        end
+        return name
+    end)
+
+    return ok and result or name
+end
+
+-- Lists the .wav files in the "sounds/" subfolder next to the script (Windows + Linux).
+-- Returns an array of bare filenames; empty on any error so callers degrade gracefully.
+local function list_notification_sounds()
+    local dir = (SCRIPT_DIR or "") .. "sounds"
+    local files = {}
+
+    if not WINDOWS_FFI_AVAILABLE then
+        if command_exists("ls") then
+            local out = capture_command_output("ls -1 " .. quote_shell_arg(dir) .. "/*.wav 2>/dev/null")
+            if out then
+                for line in string.gmatch(out, "[^\r\n]+") do
+                    local name = string.match(line, "([^/\\]+)$")
+                    if name and name ~= "" then table.insert(files, name) end
+                end
+            end
+        end
+        return files
+    end
+
+    local ok = pcall(function()
+        local wsearch = utf8_to_wide(string.gsub(dir .. "/*.wav", "/", "\\"))
+        if not wsearch then return end
+        local data = ffi.new("WIN32_FIND_DATAW")
+        local handle = kernel32.FindFirstFileW(wsearch, data)
+        if is_invalid_handle(handle) then return end
+        repeat
+            local name = wide_to_utf8(data.cFileName, wide_strlen(data.cFileName, 260))
+            if name and name ~= "." and name ~= ".." and name ~= "" then
+                table.insert(files, name)
+            end
+        until kernel32.FindNextFileW(handle, data) == 0
+        kernel32.FindClose(handle)
+    end)
+    if not ok then return {} end
+    return files
+end
+
+local function delete_file(path)
+    if not WINDOWS_FFI_AVAILABLE then os.remove(path) return end
+    local ok, err = pcall(function()
+        path = string.gsub(path, "/", "\\")
+        local len = kernel32.MultiByteToWideChar(WIN.CP_UTF8, 0, path, -1, nil, 0)
+        if len > 0 and len <= WIN.MAX_PATH then
+            local wpath = ffi.new("unsigned short[?]", len)
+            kernel32.MultiByteToWideChar(WIN.CP_UTF8, 0, path, -1, wpath, len)
+            local result = kernel32.DeleteFileW(wpath)
+            if result == 0 then
+                error("DeleteFileW failed")
+            end
+        elseif len > WIN.MAX_PATH then
+            error("Path exceeds MAX_PATH limit: " .. len .. " chars")
+        end
+    end)
+
+    if not ok then
+        dbg("Windows delete failed, trying os.remove: " .. tostring(err))
+        os.remove(path)
+    end
+end
+
+-- Create directory with race condition protection
+local function safe_mkdir(path)
+    if obs.os_file_exists(path) then
+        return true
+    end
+
+    recursive_mkdir(path)
+
+    return obs.os_file_exists(path)
+end
+
+-- Get file size
+local function get_file_size(path)
+    if not WINDOWS_FFI_AVAILABLE then
+        local file = io.open(path, "rb")
+        if not file then return 0 end
+        local size = file:seek("end") or 0
+        file:close()
+        return size
+    end
+    local ok, result = pcall(function()
+        path = string.gsub(path, "/", "\\")
+        local wpath = utf8_to_wide(path)  -- UTF-16 path -> lossless for any language
+        if not wpath then return 0 end
+        local data = ffi.new("WIN32_FIND_DATAW")
+        local handle = kernel32.FindFirstFileW(wpath, data)
+
+        if not is_invalid_handle(handle) then
+            kernel32.FindClose(handle)
+            local size = data.nFileSizeHigh * 4294967296 + data.nFileSizeLow
+            return size
+        end
+        return 0
+    end)
+    return ok and result or 0
+end
+
+-- Milliseconds for deferred-queue timing (monotonic when os_gettime_ns exists)
+local function now_ms()
+    if obs.os_gettime_ns then
+        return obs.os_gettime_ns() / 1000000
+    end
+    return os.time() * 1000
+end
+
+-- TRUE if no other process holds the file open (Windows exclusive-open probe).
+-- Without FFI (or on Linux) always TRUE - size stability is the only guard there.
+local function is_file_unlocked(path)
+    if not WINDOWS_FFI_AVAILABLE then return true end
+    local ok, result = pcall(function()
+        local wpath = utf8_to_wide((string.gsub(path, "/", "\\")))
+        if not wpath then return true end
+        local handle = kernel32.CreateFileW(wpath, WIN.GENERIC_READ, 0, nil,
+                                            WIN.OPEN_EXISTING, WIN.FILE_ATTRIBUTE_NORMAL, nil)
+        if is_invalid_handle(handle) then
+            return false
+        end
+        kernel32.CloseHandle(handle)
+        return true
+    end)
+    if not ok then return true end  -- probe error: fail open, the move attempt decides
+    return result
+end
+
+-- ============================================================================
+-- FFMPEG SUPPORT (FFI / Sync ShellExecuteEx Method)
+-- ============================================================================
+
+local function is_video_file(path)
+    if not path then return false end
+    local ext = string.lower(string.match(path, "%.([^.]+)$") or "")
+    local video_exts = {
+        ["mp4"] = true, ["mkv"] = true, ["mov"] = true, ["flv"] = true,
+        ["ts"] = true, ["m3u8"] = true, ["avi"] = true, ["webm"] = true
+    }
+    return video_exts[ext] or false
+end
+
+local function run_task_sync_hidden(commands, unique_id)
+    if not WINDOWS_FFI_AVAILABLE then
+        for _, cmd in ipairs(commands) do
+            -- Redirect stderr to /dev/null for clean execution
+            local full_cmd = cmd .. " 2>/dev/null"
+            dbg("Linux exec: " .. cmd)
+            if not run_shell_command(full_cmd) then
+                log("ERROR: Linux command failed: " .. cmd)
+                return false
+            end
+        end
+        return true
+    end
+    local bat_path = join_path(TEMP_DIR, "srm_sync_" .. unique_id .. ".bat")
+
+    local f_bat = io.open(bat_path, "w")
+    if not f_bat then
+        log("ERROR: Could not create temp batch file")
+        return false
+    end
+    
+    f_bat:write("@echo off\n")
+    -- chcp 65001 is critical for non-English filenames
+    f_bat:write("chcp 65001 > nul\n")
+    
+    for _, cmd in ipairs(commands) do
+        f_bat:write(cmd .. "\n")
+        f_bat:write("if %errorlevel% neq 0 exit /b %errorlevel%\n")
+    end
+    f_bat:close()
+
+    -- Prepare ShellExecuteEx structure
+    local sei = ffi.new("SHELLEXECUTEINFOA")
+    sei.cbSize = ffi.sizeof("SHELLEXECUTEINFOA")
+    sei.fMask = WIN.SEE_MASK_NOCLOSEPROCESS -- We need the process handle to wait
+    sei.hwnd = nil
+    sei.lpVerb = "open"
+    sei.lpFile = "cmd.exe"
+    sei.lpParameters = "/c \"" .. bat_path .. "\""
+    sei.lpDirectory = nil
+    sei.nShow = WIN.SW_HIDE
+    sei.hInstApp = nil
+
+    -- Execute and retain the process handle so both waiting and the final child
+    -- exit status can be checked. ShellExecuteEx success only means cmd.exe was
+    -- launched; it does not mean the generated FFmpeg batch completed.
+    if shell32.ShellExecuteExA(sei) == 0 then
+        log("ERROR: ShellExecuteEx failed")
+        os.remove(bat_path)
+        return false
+    end
+
+    if sei.hProcess == nil then
+        log("ERROR: ShellExecuteEx returned no process handle")
+        os.remove(bat_path)
+        return false
+    end
+
+    -- SAFETY: INFINITE wait required for large video files (embedding can take minutes)
+    -- WARNING: This will block OBS UI during the operation!
+    -- This is expected behavior for a synchronous operation to ensure file integrity.
+    local wait_result = tonumber(kernel32.WaitForSingleObject(sei.hProcess, WIN.INFINITE))
+    if wait_result ~= WIN.WAIT_OBJECT_0 then
+        log("ERROR: Waiting for FFmpeg task failed (status " .. tostring(wait_result) .. ")")
+        kernel32.CloseHandle(sei.hProcess)
+        os.remove(bat_path)
+        return false
+    end
+
+    local exit_code = ffi.new("DWORD[1]")
+    if kernel32.GetExitCodeProcess(sei.hProcess, exit_code) == 0 then
+        log("ERROR: Could not read FFmpeg task exit code")
+        kernel32.CloseHandle(sei.hProcess)
+        os.remove(bat_path)
+        return false
+    end
+
+    local task_exit_code = tonumber(exit_code[0])
+    kernel32.CloseHandle(sei.hProcess)
+    os.remove(bat_path)
+
+    if task_exit_code ~= 0 then
+        log("ERROR: FFmpeg task exited with code " .. tostring(task_exit_code))
+        return false
+    end
+
+    return true
+end
+
+-- Locate the ffprobe executable shipped alongside the configured FFmpeg.
+-- ffprobe is required for safe MP4 stream-metadata preservation and validation.
+local function resolve_ffprobe_path(ffmpeg_path)
+    local directory = string.match(ffmpeg_path or "", "^(.*[/\\])")
+
+    -- Windows: never shell out to locate it. os.execute would flash a console window
+    -- and defeat the hidden task runner, so fall back to the bare name and let the
+    -- hidden batch resolve it through PATH.
+    if IS_WINDOWS then
+        local candidate = directory and (directory .. "ffprobe.exe") or "ffprobe.exe"
+        if obs.os_file_exists(candidate) then return candidate end
+        return "ffprobe.exe"
+    end
+
+    if ffmpeg_path == "ffmpeg" then
+        return command_exists("ffprobe") and "ffprobe" or nil
+    end
+
+    local candidate = directory and (directory .. "ffprobe") or "ffprobe"
+    if obs.os_file_exists(candidate) then return candidate end
+    return command_exists("ffprobe") and "ffprobe" or nil
+end
+
+-- Arguments end up inside a temporary .bat on Windows, so percent signs must be
+-- doubled to prevent cmd.exe variable expansion.
+local function quote_task_arg(value)
+    if not IS_WINDOWS then return quote_shell_arg(value) end
+    return '"' .. tostring(value):gsub("%%", "%%%%"):gsub('"', '\\"') .. '"'
+end
+
+local function get_preserved_audio_name(tags)
+    if not tags then return nil end
+    if tags.name and tags.name ~= "" then return tags.name end
+    if tags.title and tags.title ~= "" then return tags.title end
+
+    -- Keep a genuinely descriptive handler name, but do not promote the
+    -- generic values written by OBS/FFmpeg into user-visible track labels.
+    local handler_name = tags.handler_name
+    local generic_handlers = {
+        ["soundhandler"] = true,
+        ["obs audio handler"] = true,
+    }
+    if handler_name and handler_name ~= "" and
+       not generic_handlers[string.lower(handler_name)] then
+        return handler_name
+    end
+    return nil
+end
+
+-- Read the media layout in a small, deterministic text format. The resulting
+-- table is used both to capture source MP4 audio labels and to validate the
+-- remuxed output before the original recording may be deleted.
+local function probe_media_streams(ffmpeg_path, path, unique_id, phase)
+    local ffprobe_path = resolve_ffprobe_path(ffmpeg_path)
+    if not ffprobe_path then
+        return nil, "ffprobe was not found beside FFmpeg or in PATH"
+    end
+
+    local probe_output = join_path(
+        TEMP_DIR,
+        string.format("srm_probe_%s_%s.txt", unique_id, phase or "media")
+    )
+    local command = string.format(
+        '%s -v error -show_entries "stream=codec_type:stream_disposition=attached_pic:stream_tags=name,title,handler_name" -of "default=noprint_wrappers=0:nokey=0" %s > %s',
+        quote_task_arg(ffprobe_path), quote_task_arg(path), quote_task_arg(probe_output)
+    )
+
+    -- Never accept stale probe data if a previous process was interrupted.
+    os.remove(probe_output)
+    if not run_task_sync_hidden({ command }, unique_id .. "_probe_" .. (phase or "media")) then
+        os.remove(probe_output)
+        return nil, "ffprobe could not inspect the file (is ffprobe next to ffmpeg?)"
+    end
+
+    local probe_file = io.open(probe_output, "r")
+    if not probe_file then
+        os.remove(probe_output)
+        return nil, "ffprobe did not create readable output"
+    end
+
+    local output = probe_file:read("*a") or ""
+    probe_file:close()
+    os.remove(probe_output)
+    if output == "" then
+        return nil, "ffprobe returned no stream information"
+    end
+
+    local info = {
+        audio_count = 0,
+        audio_names = {},
+        primary_video_count = 0,
+        attached_pic_count = 0,
+    }
+    local stream = nil
+
+    local function finish_stream()
+        if not stream then return end
+        if stream.codec_type == "audio" then
+            info.audio_count = info.audio_count + 1
+            info.audio_names[info.audio_count] =
+                get_preserved_audio_name(stream.tags) or false
+        elseif stream.codec_type == "video" then
+            if stream.attached_pic then
+                info.attached_pic_count = info.attached_pic_count + 1
+            else
+                info.primary_video_count = info.primary_video_count + 1
+            end
+        end
+    end
+
+    for line in string.gmatch(output, "[^\r\n]+") do
+        if line == "[STREAM]" then
+            stream = { tags = {}, attached_pic = false }
+        elseif line == "[/STREAM]" then
+            finish_stream()
+            stream = nil
+        elseif stream then
+            local key, value = string.match(line, "^([^=]+)=(.*)$")
+            if key == "codec_type" then
+                stream.codec_type = value
+            elseif key == "DISPOSITION:attached_pic" then
+                stream.attached_pic = value == "1"
+            else
+                local tag_key = string.match(key or "", "^TAG:(.+)$")
+                if tag_key and value and value ~= "" then
+                    stream.tags[tag_key] = value
+                end
+            end
+        end
+    end
+
+    return info
+end
+
+local function verify_mp4_thumbnail_output(ffmpeg_path, target, expected, unique_id)
+    local actual, probe_error = probe_media_streams(
+        ffmpeg_path, target, unique_id, "output"
+    )
+    if not actual then
+        return false, "could not verify output: " .. tostring(probe_error)
+    end
+
+    if actual.primary_video_count ~= expected.primary_video_count then
+        return false, string.format(
+            "primary video stream count changed (%d -> %d)",
+            expected.primary_video_count, actual.primary_video_count
+        )
+    end
+    if actual.audio_count ~= expected.audio_count then
+        return false, string.format(
+            "audio stream count changed (%d -> %d)",
+            expected.audio_count, actual.audio_count
+        )
+    end
+    if actual.attached_pic_count < 1 then
+        return false, "embedded cover-art stream is missing"
+    end
+
+    for index = 1, expected.audio_count do
+        local expected_name = expected.audio_names[index]
+        if expected_name and actual.audio_names[index] ~= expected_name then
+            return false, string.format(
+                "audio track %d name changed (%s -> %s)",
+                index,
+                tostring(expected_name),
+                tostring(actual.audio_names[index] or "missing")
+            )
+        end
+    end
+
+    return true
+end
+
+local function run_ffmpeg_thumbnail(ffmpeg_path, src, target, offset)
+    if not ffmpeg_path or ffmpeg_path == "" then return false end
+
+    local source_ext = string.lower(string.match(src, "%.([^.]+)$") or "")
+    if source_ext ~= "mp4" and source_ext ~= "mkv" then
+        log("Thumbnail embedding skipped for ." .. source_ext ..
+            " files; only MP4 and MKV are supported safely")
+        return false, "unsupported_container"
+    end
+
+    -- Path correction
+    local lower_path = string.lower(ffmpeg_path)
+    if IS_WINDOWS then
+        if not string.match(lower_path, "%.exe$") then
+            local try_bin = ffmpeg_path .. "/ffmpeg.exe"
+            local try_bin_sub = ffmpeg_path .. "/bin/ffmpeg.exe"
+            if obs.os_file_exists(try_bin) then ffmpeg_path = try_bin
+            elseif obs.os_file_exists(try_bin_sub) then ffmpeg_path = try_bin_sub end
+        end
+    else
+        -- On Linux, allow bare "ffmpeg" (found via PATH) or explicit path
+        if ffmpeg_path == "ffmpeg" then
+            -- Use system ffmpeg from PATH — check if it exists
+            if not command_exists("ffmpeg") then
+                log("ERROR: ffmpeg not found in PATH")
+                return false
+            end
+        elseif not string.match(lower_path, "/ffmpeg$") then
+            local try_bin = ffmpeg_path .. "/ffmpeg"
+            local try_bin_sub = ffmpeg_path .. "/bin/ffmpeg"
+            if obs.os_file_exists(try_bin) then ffmpeg_path = try_bin
+            elseif obs.os_file_exists(try_bin_sub) then ffmpeg_path = try_bin_sub
+            else
+                log("ERROR: ffmpeg not found at: " .. ffmpeg_path)
+                return false
+            end
+        elseif not obs.os_file_exists(ffmpeg_path) then
+            log("ERROR: ffmpeg not found at: " .. ffmpeg_path)
+            return false
+        end
+    end
+
+    math.randomseed(os.time() + (os.clock() * 1000))
+    local unique_id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+    local temp_thumb = src .. "." .. unique_id .. ".thumb.jpg"
+    local source_info = nil
+
+    if source_ext == "mp4" then
+        local probe_error = nil
+        source_info, probe_error = probe_media_streams(
+            ffmpeg_path, src, unique_id, "source"
+        )
+        if not source_info then
+            log("WARNING: MP4 thumbnail embedding skipped: " .. tostring(probe_error))
+            log("The original recording will be moved without remuxing so its track names remain intact")
+            return false, "probe_failed"
+        end
+        if source_info.primary_video_count < 1 then
+            log("WARNING: MP4 thumbnail embedding skipped: source has no primary video stream")
+            return false, "probe_failed"
+        end
+    end
+    
+    local commands = {}
+
+    -- Build commands with platform-appropriate quoting
+    -- Windows: double quotes work in .bat files
+    -- Linux: use shell-safe single-quote escaping
+    -- On Windows these land in a .bat, so % must be doubled ("100% Orange Juice").
+    local q = quote_task_arg
+    
+    table.insert(commands, string.format('%s -sseof -%.1f -i %s -vframes 1 -q:v 2 -y %s',
+        q(ffmpeg_path), offset, q(src), q(temp_thumb)))
+        
+    -- Embed and Move
+    -- Logic depends on container type:
+    -- MKV supports "Attachments" (Best for Cover Art support in Windows/Icaros)
+    -- MP4 requires "Video Stream" with Disposition (Apple/Standard style)
+    
+    local is_mkv = source_ext == "mkv"
+    local cmd_embed = ""
+    
+    if is_mkv then
+        cmd_embed = string.format('%s -i %s -map 0 -c copy -attach %s -metadata:s:t:0 mimetype=image/jpeg -metadata:s:t:0 filename=cover.jpg -y %s',
+            q(ffmpeg_path), q(src), q(temp_thumb), q(target))
+    else
+        local audio_metadata = {}
+
+        for audio_index = 0, source_info.audio_count - 1 do
+            local track_name = source_info.audio_names[audio_index + 1]
+            if track_name and track_name ~= "" then
+                table.insert(audio_metadata, string.format(
+                    '-metadata:s:a:%d %s',
+                    audio_index,
+                    quote_task_arg("title=" .. track_name)
+                ))
+                dbg(string.format(
+                    "Preserving audio track %d name: %s",
+                    audio_index + 1,
+                    track_name
+                ))
+            end
+        end
+
+        cmd_embed = string.format('%s -i %s -i %s -map 0 -map 1 -c:v:0 copy -c:a copy -c:v:1 mjpeg -disposition:v:1 attached_pic -metadata:s:v:1 title=Cover_Art %s -y %s',
+            q(ffmpeg_path), q(src), q(temp_thumb),
+            table.concat(audio_metadata, " "), q(target))
+    end
+        
+    table.insert(commands, cmd_embed)
+    
+    -- Sync Logic: We manage files in Lua now because we WAIT for completion
+    -- No "del" commands in batch needed for result files, only temps
+    
+    dbg("Processing Thumbnail (Sync): " .. unique_id)
+    
+    -- Run it!
+    local task_succeeded = run_task_sync_hidden(commands, unique_id)
+    
+    -- Cleanup temp thumb (it sits next to the source, so the path can be non-ASCII)
+    delete_file(temp_thumb)
+
+    if not task_succeeded then
+        return false
+    end
+    
+    -- Validation (Now safe because process is guaranteed finished)
+    if obs.os_file_exists(target) then
+        local src_size = get_file_size(src)
+        local target_size = get_file_size(target)
+        
+        -- If target is valid (not empty and reasonable size)
+        if target_size > (src_size * 0.9) then
+            if source_ext == "mp4" then
+                local verified, verification_error = verify_mp4_thumbnail_output(
+                    ffmpeg_path, target, source_info, unique_id
+                )
+                if not verified then
+                    log("ERROR: MP4 thumbnail verification failed: " ..
+                        tostring(verification_error))
+                    return false, "verification_failed"
+                end
+                dbg("MP4 thumbnail output verified successfully")
+            end
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Replay Buffer Pro writes its trimmed clip as "X_trimmed.ext" (suffix inserted
+-- before the LAST dot) and then deletes the original "X.ext" - mirror that rule
+local function make_trimmed_path(path)
+    local stem, ext = string.match(path, "^(.*)(%.[^./\\]+)$")
+    if not stem then return path .. "_trimmed" end
+    return stem .. "_trimmed" .. ext
+end
+
+-- "clip.mp4" -> "clip (2).mp4" when the target already exists.
+-- os_rename on Windows is MoveFileExW(REPLACE_EXISTING): without this check a
+-- name collision would silently OVERWRITE the existing file.
+local function uniquify_path(path)
+    local ok, result = pcall(function()
+        if not obs.os_file_exists(path) then return path end
+        local stem, ext = string.match(path, "^(.*)(%.[^./\\]+)$")
+        if not stem then stem, ext = path, "" end
+        for n = 2, 99 do
+            local candidate = stem .. " (" .. n .. ")" .. ext
+            if not obs.os_file_exists(candidate) then
+                log("Target exists, using collision-safe name: " .. candidate)
+                return candidate
+            end
+        end
+        return stem .. " (" .. os.time() .. ")" .. ext
+    end)
+    return ok and result or path
+end
+
+local function move_file(src, folder_name, game_name, media_type, split_info)
+    local ok, result = pcall(function()
+        src = string.gsub(src, "\\", "/")
+
+        local dir, filename = string.match(src, "^(.*)/(.*)$")
+        if not dir or not filename then
+            log("ERROR: Cannot parse source path - invalid format: " .. tostring(src))
+            return false
+        end
+
+        if not obs.os_file_exists(src) then
+            log("ERROR: Source file does not exist: " .. src)
+            return false
+        end
+
+        local file_size = get_file_size(src)
+        if file_size == 0 then
+            log("WARNING: Source file appears empty or inaccessible: " .. src)
+        elseif file_size < 1024 then
+            dbg("File is very small (" .. file_size .. " bytes), might be incomplete")
+        end
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- "NO FOLDER" MODE: folder_name == ".", "/", or "\" means keep in OBS root
+        -- File stays in the same directory, only prefix is added (if enabled)
+        -- ═══════════════════════════════════════════════════════════════
+        if folder_name == "." or folder_name == "/" or folder_name == "\\" then
+            dbg("No-folder mode active, keeping file in output root")
+            local new_filename = filename
+            -- Still add prefix if enabled and game_name is meaningful
+            local should_add_prefix = CONFIG.add_game_prefix and game_name and game_name ~= "" and (game_name ~= "." and game_name ~= "/" and game_name ~= "\\") and game_name ~= CONFIG.fallback_folder
+            if should_add_prefix then
+                local safe_game = clean_filename(game_name)
+                new_filename = safe_game .. " - " .. filename
+                dbg("No-folder mode: added prefix -> " .. new_filename)
+            end
+            local target_path = dir .. "/" .. new_filename
+            -- If filename didn't change, nothing to do
+            if target_path == src then
+                log("No-folder mode: file already in place (no prefix): " .. filename)
+                STATE.files_moved = STATE.files_moved + 1
+                return true
+            end
+            target_path = uniquify_path(target_path)
+            if obs.os_rename(src, target_path) == 0 then
+                log("Renamed (no-folder mode): " .. new_filename)
+                STATE.files_moved = STATE.files_moved + 1
+                return true
+            end
+            log("ERROR: Failed to rename file in no-folder mode")
+            return false
+        end
+
+        local safe_folder = clean_folder_path(folder_name)
+        local real_folder = safe_folder
+        
+        -- If safe_folder contains separators (nested folder), skip fuzzy existing check
+        -- Otherwise (simple folder), try to find existing folder with matching case (e.g. "game" -> "Game")
+        if not string.find(safe_folder, "[/\\]") then
+            real_folder = get_existing_folder(dir, safe_folder)
+        end
+        
+        -- Build the destination from the folder template; {game} is the detected folder.
+        local template = (CONFIG.folder_template ~= nil and CONFIG.folder_template ~= "")
+                         and CONFIG.folder_template or "{game}"
+        local rel = sanitize_relative_path(apply_folder_template(template, real_folder, media_type))
+        if rel == "" then rel = real_folder end
+        local target_dir = dir .. "/" .. rel
+
+        -- Legacy monthly subfolders (until the user migrates to {yearmonth}).
+        if CONFIG.use_date_subfolders then
+            target_dir = target_dir .. "/" .. os.date("%Y-%m")
+        end
+
+        -- Split recordings: one folder per session, parts numbered inside it. The
+        -- game prefix below is deliberately left to add_game_prefix, so the game name
+        -- survives templates that do not contain {game}.
+        local base_name = filename
+        if split_info and CONFIG.group_split_recordings and split_info.stamp then
+            local split_ext = string.match(filename, "%.([^.]+)$")
+            if split_ext then
+                base_name = string.format("Part %02d.%s", split_info.index, split_ext)
+                target_dir = target_dir .. "/" .. split_info.stamp
+                dbg("Split session folder: " .. split_info.stamp .. " -> " .. base_name)
+            end
+        end
+
+        local new_filename = base_name
+        local should_add_prefix = CONFIG.add_game_prefix and game_name and game_name ~= "" and game_name ~= CONFIG.fallback_folder
+
+        dbg("Prefix check: add_game_prefix=" .. tostring(CONFIG.add_game_prefix) ..
+              ", game_name=" .. tostring(game_name) ..
+              ", fallback=" .. tostring(CONFIG.fallback_folder) ..
+              ", will_add=" .. tostring(should_add_prefix))
+
+        if should_add_prefix then
+            -- Prefix mirrors the actual destination folder (custom/DB name), not the raw process name
+            -- For nested paths (e.g., "Singleplayer/DS3"), use only the last segment as prefix
+            local prefix_source = real_folder
+            if string.find(prefix_source, "[/\\]") then
+                prefix_source = string.match(prefix_source, "([^/\\]+)$") or prefix_source
+                dbg("Nested path detected, using last segment for prefix: " .. prefix_source)
+            end
+            local safe_game = clean_filename(prefix_source)
+            new_filename = safe_game .. " - " .. base_name
+            dbg("Added prefix: " .. new_filename)
+        end
+
+        local target_path = target_dir .. "/" .. new_filename
+
+        local valid, err = validate_path_length(target_path)
+        if not valid then
+            dbg("Path too long, truncating filename: " .. err)
+            -- Keep room for the " (99)" that uniquify_path may append below. A folder too deep
+            -- for that is truncated without it; the check after uniquify_path still refuses
+            -- to overwrite, so only a clip whose name is already taken stays behind.
+            local max_filename_len = WIN.MAX_PATH - #target_dir - 2 - 5
+            if max_filename_len < 20 then
+                max_filename_len = max_filename_len + 5
+            end
+            if max_filename_len < 20 then
+                log("ERROR: Directory path too long, cannot fit filename: " .. target_dir)
+                return false
+            end
+            new_filename = truncate_filename(new_filename, max_filename_len)
+            target_path = target_dir .. "/" .. new_filename
+            dbg("Truncated filename to: " .. new_filename)
+        end
+
+        -- One recursive mkdir creates every level of the template path.
+        if not safe_mkdir(target_dir) then
+            log("ERROR: Failed to create folder: " .. target_dir)
+            return false
+        end
+        dbg("Folder ready: " .. target_dir)
+
+        -- Collision-safe target name (avoid silent overwrite by MoveFileExW)
+        target_path = uniquify_path(target_path)
+        if not validate_path_length(target_path) then
+            -- The original name is taken, which is why uniquify_path picked another one;
+            -- falling back to it would overwrite that clip. Leave this file in place instead.
+            log("ERROR: No free file name fits the path length limit, leaving the file in place: " .. src)
+            return false
+        end
+
+        -- FFMPEG THUMBNAIL LOGIC
+        -- Not repeated for a file that already failed to move: the deferred queue retries
+        -- every second, and each FFmpeg run blocks OBS until it exits.
+        if CONFIG.enable_thumbnails and is_video_file(src) and CONFIG.ffmpeg_path ~= ""
+           and not STATE.failed_moves[src] then
+            log("Attempting to embed thumbnail with FFmpeg...")
+            local thumbnail_ok, thumbnail_error = run_ffmpeg_thumbnail(
+                CONFIG.ffmpeg_path, src, target_path, CONFIG.thumbnail_offset
+            )
+            if thumbnail_ok then
+                log("Thumbnail embedded successfully!")
+                log("Moved (FFmpeg): " .. new_filename)
+                log("To: " .. target_dir)
+                
+                -- Delete original source file since FFmpeg created a new one.
+                -- delete_file, not os.remove: on Windows os.remove fails on non-ASCII paths.
+                delete_file(src)
+                if obs.os_file_exists(src) then
+                    log("WARNING: Could not delete the original after FFmpeg, it is still at: " .. src)
+                end
+
+                STATE.files_moved = STATE.files_moved + 1
+                return true
+            else
+                if thumbnail_error == "unsupported_container" then
+                    log("Moving without thumbnail to preserve the original container")
+                elseif thumbnail_error == "probe_failed" then
+                    log("Moving without thumbnail because MP4 metadata could not be preserved safely")
+                elseif thumbnail_error == "verification_failed" then
+                    log("Moving without thumbnail because the remuxed MP4 did not pass verification")
+                else
+                    log("FFmpeg failed or produced invalid file. Falling back to standard move.")
+                end
+                -- Clean up potential failed target file
+                if obs.os_file_exists(target_path) then
+                    delete_file(target_path)
+                end
+            end
+        end
+
+        -- STANDARD MOVE (Fallback)
+        if obs.os_rename(src, target_path) == 0 then
+            STATE.failed_moves[src] = nil
+            log("Moved: " .. new_filename)
+            log("To: " .. target_dir)
+            if file_size > 0 then
+                dbg("File size: " .. string.format("%.2f", file_size / 1024 / 1024) .. " MB")
+            end
+            STATE.files_moved = STATE.files_moved + 1
+            return true
+        end
+
+        -- The deferred queue retries a failed move every second; log the details once.
+        if not STATE.failed_moves[src] then
+            log("ERROR: Failed to move file")
+            log("  From: " .. src)
+            log("  To: " .. target_path)
+            STATE.failed_moves[src] = true
+        end
+        return false
+    end)
+
+    if not ok then
+        log("ERROR: Exception in move_file: " .. tostring(result))
+        return false
+    end
+    return result
+end
+
+
+-- ============================================================================
+-- EVENT HANDLING
+-- ============================================================================
+
+local function get_replay_path()
+    local replay = obs.obs_frontend_get_replay_buffer_output()
+    if not replay then return nil end
+
+    local cd = obs.calldata_create()
+    local ph = obs.obs_output_get_proc_handler(replay)
+    obs.proc_handler_call(ph, "get_last_replay", cd)
+    local path = obs.calldata_string(cd, "path")
+    obs.calldata_destroy(cd)
+    obs.obs_output_release(replay)
+
+    return path
+end
+
+local function get_recording_path()
+    local path = obs.obs_frontend_get_last_recording()
+    return path
+end
+
+local function process_file(path, media_type, split_info)
+    if not path or path == "" then
+        log("ERROR: No file path provided")
+        return false
+    end
+
+    local raw_game, window_title, skip_fallback = detect_game()
+    local folder_name = get_game_folder(raw_game, window_title, skip_fallback)
+
+    if raw_game then
+        log("Game: " .. raw_game .. " -> " .. folder_name)
+    else
+        log("No game detected, using: " .. folder_name)
+    end
+
+    return move_file(path, folder_name, folder_name, media_type, split_info)
+end
+
+local function process_file_with_game(path, folder_name, game_name, media_type, split_info)
+    if not path or path == "" then
+        log("ERROR: No file path provided")
+        return false
+    end
+
+    if not folder_name then
+        return process_file(path, media_type, split_info)
+    end
+
+    log("Game folder: " .. folder_name)
+    return move_file(path, folder_name, game_name or folder_name, media_type, split_info)
+end
+
+-- ============================================================================
+-- DEFERRED MOVE QUEUE (v2.10.0)
+-- Replays are no longer moved synchronously inside the SAVED event. Each save
+-- is queued and flushed by this 1s timer once the file has settled. This lets
+-- Replay Buffer Pro finish its background trim (it writes "X_trimmed" next to
+-- "X", then deletes "X") before we organize the final file.
+-- ============================================================================
+
+local function process_move_queue()
+    local ok, err = pcall(function()
+        local q = STATE.pending_moves
+        local now = now_ms()
+
+        local function try_flush(job, candidate)
+            if process_file_with_game(candidate, job.folder_name, job.raw_game, job.media_type) then
+                STATE.last_flushed_path = job.path
+                STATE.last_flushed_time = os.time()
+                notify("Clip Saved", "Moved to: " .. job.folder_name)
+                return true
+            end
+            return false  -- locked or failed: retry on the next tick
+        end
+
+        for i = #q, 1, -1 do
+            local job = q[i]
+            local age = now - job.created_at
+            local grace = job.trimmed_path and 3000 or 1000
+            local done = false
+
+            if now > job.hard_deadline then
+                log("WARNING: Move job exceeded 30min hard cap, dropping (file kept): " .. job.path)
+                STATE.files_skipped = STATE.files_skipped + 1
+                done = true
+            elseif age >= grace then
+                local x_exists = obs.os_file_exists(job.path)
+                local t_exists = job.trimmed_path ~= nil and obs.os_file_exists(job.trimmed_path)
+
+                if x_exists and t_exists then
+                    -- RBP trim in progress (reads X, writes X_trimmed) - wait
+                    job.deadline = now + 120000
+                    job.stable_count = 0
+                elseif t_exists then
+                    -- Trim finished: X deleted, trimmed file is closed and final
+                    local candidate = job.trimmed_path
+                    if CONFIG.strip_trimmed_suffix and not obs.os_file_exists(job.path) then
+                        if obs.os_rename(job.trimmed_path, job.path) == 0 then
+                            candidate = job.path
+                            dbg("Stripped _trimmed suffix: " .. job.path)
+                        end
+                    end
+                    done = try_flush(job, candidate)
+                elseif x_exists then
+                    if not job.trimmed_path then
+                        -- Vanilla mode: file is final at SAVED, flush after grace
+                        done = try_flush(job, job.path)
+                    else
+                        -- RBP mode but no trim seen (Save Full Buffer / native
+                        -- hotkey): 2 stable size checks + no open handles first
+                        local size = get_file_size(job.path)
+                        if size > 0 and size == job.last_size then
+                            job.stable_count = job.stable_count + 1
+                        else
+                            job.stable_count = 0
+                        end
+                        job.last_size = size
+                        if job.stable_count >= 2 and is_file_unlocked(job.path) then
+                            done = try_flush(job, job.path)
+                        end
+                    end
+                else
+                    dbg("Queued replay no longer on disk (external consumer?): " .. job.path)
+                    STATE.files_skipped = STATE.files_skipped + 1
+                    done = true
+                end
+
+                if not done and now > job.deadline then
+                    log("ERROR: Could not organize replay within 120s, leaving in place: " .. job.path)
+                    notify("Move Failed", "File left in place")
+                    STATE.files_skipped = STATE.files_skipped + 1
+                    done = true  -- never delete, just stop tracking
+                end
+            end
+
+            if done then table.remove(q, i) end
+        end
+
+        if #q == 0 and STATE.move_timer_running then
+            obs.timer_remove(process_move_queue)
+            STATE.move_timer_running = false
+        end
+    end)
+    if not ok then
+        log("ERROR in move queue: " .. tostring(err))
+    end
+end
+
+-- ============================================================================
+-- RECORDING SIGNAL HANDLERS & SPLIT FILE TRACKING
+-- ============================================================================
+
+-- IMPORTANT: This must be declared BEFORE on_recording_file_changed()
+-- so the function captures the local upvalue, not a global with the same name.
+local current_recording_file = nil
+
+local function on_recording_file_changed(calldata)
+    local ok, err = pcall(function()
+        if not CONFIG.organize_recordings then
+            return
+        end
+
+        local next_file = obs.calldata_string(calldata, "next_file")
+
+        dbg("File split signal received, next_file: " .. tostring(next_file))
+
+        if STATE.recording_folder_name then
+            -- Safety net: if current_recording_file was never set (get_last_file + settings both failed),
+            -- try one last time from the recording output we already hold a reference to
+            if (not current_recording_file or current_recording_file == "") and STATE.recording_output_ref then
+                local settings = obs.obs_output_get_settings(STATE.recording_output_ref)
+                if settings then
+                    local path = obs.obs_data_get_string(settings, "path")
+                    if not path or path == "" then
+                        path = obs.obs_data_get_string(settings, "url")
+                    end
+                    if path and path ~= "" and path ~= next_file then
+                        current_recording_file = path
+                        dbg("Recovered previous file from output settings: " .. path)
+                    end
+                    obs.obs_data_release(settings)
+                end
+            end
+
+            -- The previous segment is in current_recording_file (set during init or previous split)
+            -- Move it to the game folder before updating to the new file
+            if current_recording_file and current_recording_file ~= "" then
+                -- Capture values for the closure (they may change by the time the timer fires)
+                local file_to_move = current_recording_file
+                local folder = STATE.recording_folder_name
+                local game = STATE.recording_game_name
+
+                -- Count the boundary here, not inside the timer: RECORDING_STOPPED moves
+                -- the final segment synchronously, so a stop within 300ms of a split would
+                -- otherwise hand the same number to two files.
+                STATE.recording_split_index = (STATE.recording_split_index or 0) + 1
+                local split = {
+                    index = STATE.recording_split_index,
+                    stamp = STATE.recording_session_stamp,
+                }
+
+                -- Delay move by 300ms to ensure OBS has fully released the file handle
+                local function move_split_segment()
+                    obs.timer_remove(move_split_segment)
+                    if obs.os_file_exists(file_to_move) then
+                        log("Moving split segment " .. split.index .. ": " .. file_to_move)
+                        process_file_with_game(file_to_move, folder, game, MEDIA.RECORDING, split)
+                    else
+                        dbg("Split segment file not found (may have been moved by polling): " .. file_to_move)
+                    end
+                end
+                obs.timer_add(move_split_segment, 300)
+            else
+                dbg("WARNING: Cannot move split segment - previous file path unknown")
+            end
+
+            -- Update tracking to the new file being written
+            current_recording_file = next_file
+
+            log("File split detected - using cached game: " .. STATE.recording_folder_name)
+        end
+    end)
+    if not ok then
+        log("ERROR in file_changed handler: " .. tostring(err))
+    end
+end
+
+local function disconnect_recording_signals()
+    if STATE.recording_signal_handler then
+        obs.signal_handler_disconnect(STATE.recording_signal_handler, "file_changed", on_recording_file_changed)
+        STATE.recording_signal_handler = nil
+    end
+
+    if STATE.recording_output_ref then
+        obs.obs_output_release(STATE.recording_output_ref)
+        STATE.recording_output_ref = nil
+    end
+
+    dbg("Disconnected recording signals")
+end
+
+local function connect_recording_signals()
+    disconnect_recording_signals()
+
+    local recording = obs.obs_frontend_get_recording_output()
+    if not recording then
+        dbg("No recording output available to connect signals")
+        return false
+    end
+
+    local sh = obs.obs_output_get_signal_handler(recording)
+    if not sh then
+        dbg("Could not get signal handler from recording output")
+        obs.obs_output_release(recording)
+        return false
+    end
+
+    obs.signal_handler_connect(sh, "file_changed", on_recording_file_changed)
+
+    STATE.recording_output_ref = recording
+    STATE.recording_signal_handler = sh
+
+    dbg("Connected to recording file_changed signal")
+    return true
+end
+
+-- Split file polling (fallback mechanism)
+
+local function check_split_files()
+    if not CONFIG.organize_recordings then
+        return
+    end
+
+    local recording = obs.obs_frontend_get_recording_output()
+    if not recording then
+        return
+    end
+
+    local cd = obs.calldata_create()
+    local ph = obs.obs_output_get_proc_handler(recording)
+
+    if ph then
+        local success = obs.proc_handler_call(ph, "get_last_file", cd)
+        if success then
+            local current_file = obs.calldata_string(cd, "path")
+            if current_file and current_file ~= "" and current_file ~= current_recording_file then
+                if current_recording_file and obs.os_file_exists(current_recording_file) then
+                    STATE.recording_split_index = (STATE.recording_split_index or 0) + 1
+                    log("Split detected: moving previous segment " .. STATE.recording_split_index)
+                    process_file_with_game(current_recording_file, STATE.recording_folder_name, STATE.recording_game_name, MEDIA.RECORDING, {
+                        index = STATE.recording_split_index,
+                        stamp = STATE.recording_session_stamp,
+                    })
+                end
+                current_recording_file = current_file
+                dbg("Now recording to: " .. current_file)
+            end
+        end
+    end
+
+    obs.calldata_destroy(cd)
+    obs.obs_output_release(recording)
+end
+
+local function delayed_recording_init()
+    obs.timer_remove(delayed_recording_init)
+
+    if not CONFIG.organize_recordings then return end
+
+    connect_recording_signals()
+
+    local recording = obs.obs_frontend_get_recording_output()
+    if recording then
+        local cd = obs.calldata_create()
+        local ph = obs.obs_output_get_proc_handler(recording)
+        if ph then
+            obs.proc_handler_call(ph, "get_last_file", cd)
+            current_recording_file = obs.calldata_string(cd, "path")
+            if current_recording_file and current_recording_file ~= "" then
+                dbg("Initial recording file: " .. current_recording_file)
+            end
+        end
+        obs.calldata_destroy(cd)
+
+        -- Fallback: if get_last_file didn't work (common with adv_file_output),
+        -- try reading the file path directly from the output settings
+        if not current_recording_file or current_recording_file == "" then
+            local settings = obs.obs_output_get_settings(recording)
+            if settings then
+                local path = obs.obs_data_get_string(settings, "path")
+                if not path or path == "" then
+                    path = obs.obs_data_get_string(settings, "url")
+                end
+                if path and path ~= "" then
+                    current_recording_file = path
+                    dbg("Initial recording file (from output settings): " .. path)
+                else
+                    dbg("WARNING: Could not determine initial recording file path")
+                end
+                obs.obs_data_release(settings)
+            end
+        end
+
+        obs.obs_output_release(recording)
+    end
+
+    obs.timer_add(check_split_files, 1000)
+
+    log("Recording initialized (delayed) - monitoring for file splits")
+
+    local game_info = STATE.recording_folder_name or CONFIG.fallback_folder
+    notify("Recording Started", "Game: " .. game_info)
+end
+
+
+-- Verification: confirm buffer actually started after restart, retry if not
+local buffer_verify_retries = 0
+local MAX_BUFFER_VERIFY_RETRIES = 3
+
+local function verify_buffer_started()
+    obs.timer_remove(verify_buffer_started)
+
+    local ok, active = pcall(obs.obs_frontend_replay_buffer_active)
+    if not ok then
+        dbg("Auto-restart: Could not check buffer state")
+        buffer_verify_retries = 0
+        return
+    end
+
+    if active then
+        dbg("Auto-restart: Buffer verified active ✓")
+        buffer_verify_retries = 0
+        return
+    end
+
+    buffer_verify_retries = buffer_verify_retries + 1
+    if buffer_verify_retries <= MAX_BUFFER_VERIFY_RETRIES then
+        dbg("Auto-restart: Buffer NOT active, retry " .. buffer_verify_retries .. "/" .. MAX_BUFFER_VERIFY_RETRIES)
+        obs.obs_frontend_replay_buffer_start()
+        obs.timer_add(verify_buffer_started, 2000)
+    else
+        dbg("Auto-restart: Buffer failed to start after " .. MAX_BUFFER_VERIFY_RETRIES .. " retries — giving up")
+        buffer_verify_retries = 0
+    end
+end
+
+local function start_buffer_delayed()
+    obs.timer_remove(start_buffer_delayed)
+    obs.obs_frontend_replay_buffer_start()
+    dbg("Replay Buffer auto-restarted")
+    -- Schedule verification to confirm buffer actually started
+    buffer_verify_retries = 0
+    obs.timer_add(verify_buffer_started, 2000)
+end
+
+-- Forward declaration needed because stop_buffer_for_restart references this
+local buffer_restart_safety_timeout
+
+local function stop_buffer_for_restart()
+    obs.timer_remove(stop_buffer_for_restart)
+    if not restarting_buffer_active then return end
+    obs.obs_frontend_replay_buffer_stop()
+    dbg("Auto-restart: Buffer stop called")
+    -- Safety: if STOPPED event doesn't arrive within 5s, force restart
+    obs.timer_add(buffer_restart_safety_timeout, 5000)
+end
+
+buffer_restart_safety_timeout = function()
+    obs.timer_remove(buffer_restart_safety_timeout)
+    if not restarting_buffer_active then return end
+    -- STOPPED event never fired — force restart as last resort
+    restarting_buffer_active = false
+    dbg("Auto-restart: Safety timeout — STOPPED event never arrived, forcing restart...")
+    obs.obs_frontend_replay_buffer_start()
+    dbg("Replay Buffer force-restarted (safety)")
+    -- Verify it actually started
+    buffer_verify_retries = 0
+    obs.timer_add(verify_buffer_started, 2000)
+end
+
+-- Auto-start replay buffer on OBS launch (5s delay for full initialization)
+local function auto_start_buffer_on_load()
+    obs.timer_remove(auto_start_buffer_on_load)
+    local ok, err = pcall(function()
+        obs.obs_frontend_replay_buffer_start()
+        log("Auto-started Replay Buffer on launch")
+        notify("Replay Buffer", "Auto-started on launch")
+    end)
+    if not ok then
+        dbg("Auto-start buffer failed: " .. tostring(err))
+    end
+end
+
+-- ============================================================================
+-- FRONTEND EVENT HANDLER
+-- ============================================================================
+
+local function on_event(event)
+    local ok, err = pcall(function()
+        if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
+            local now = os.time()
+            local diff = now - STATE.last_save_time
+
+            local path = get_replay_path()
+
+            if STATE.rbp_active then
+                -- RBP mode: dedupe by PATH, not by time. Rapid saves of different
+                -- durations are legit distinct clips; never delete anything here
+                -- (Replay Buffer Pro still owns the original file at this point).
+                if path then
+                    local dupe = (STATE.last_flushed_path == path
+                        and (now - STATE.last_flushed_time) < CONFIG.duplicate_cooldown)
+                    if not dupe then
+                        for _, job in ipairs(STATE.pending_moves) do
+                            if job.path == path then
+                                dupe = true
+                                break
+                            end
+                        end
+                    end
+                    if dupe then
+                        log("Duplicate SAVED event for same file - skipped: " .. path)
+                        STATE.files_skipped = STATE.files_skipped + 1
+                        return
+                    end
+                end
+            else
+                if diff < CONFIG.duplicate_cooldown then
+                    log("Spam detected (" .. string.format("%.1f", diff) .. "s)")
+                    if CONFIG.delete_spam_files and path then
+                        delete_file(path)
+                        log("Duplicate deleted")
+                    end
+                    STATE.files_skipped = STATE.files_skipped + 1
+                    return
+                end
+            end
+
+            STATE.last_save_time = now
+
+            -- Capture file size BEFORE queueing — needed for adaptive restart delay.
+            -- Must be done here because the deferred move renames the file later,
+            -- making the original path invalid for size checks.
+            local saved_file_size = 0
+            if path then
+                local fs_ok, fs_result = pcall(get_file_size, path)
+                if fs_ok then saved_file_size = fs_result end
+            end
+
+            if path then
+                local raw_game, window_title, skip_fallback = detect_game()
+                local folder_name = get_game_folder(raw_game, window_title, skip_fallback)
+
+                -- Deferred move: queue the file instead of moving it right now, so
+                -- Replay Buffer Pro (if present) can finish trimming first. Game is
+                -- detected HERE so the folder reflects the window at save time.
+                local t = now_ms()
+                table.insert(STATE.pending_moves, {
+                    path = path,
+                    trimmed_path = STATE.rbp_active and make_trimmed_path(path) or nil,
+                    folder_name = folder_name,
+                    raw_game = raw_game,
+                    media_type = MEDIA.REPLAY,
+                    created_at = t,
+                    deadline = t + 120000,
+                    hard_deadline = t + 1800000,
+                    last_size = -1,
+                    stable_count = 0,
+                })
+                if not STATE.move_timer_running then
+                    obs.timer_add(process_move_queue, 1000)
+                    STATE.move_timer_running = true
+                end
+                -- The move queue emits the single "Clip Saved" confirmation once the file is organized.
+            end
+
+            -- Auto-restart buffer logic (Prevent Overlap)
+            -- Placed OUTSIDE `if path` so buffer always restarts even if file path was nil.
+            -- Uses ADAPTIVE delay based on file size: larger files need more time for OBS
+            -- to fully stabilize internally after saving (flushing, muxer cleanup, etc.).
+            -- Calling stop() too soon after a large save hangs OBS in "Stopping..." state.
+            if CONFIG.restart_buffer_after_save then
+                restarting_buffer_active = true
+
+                -- Calculate adaptive delay: base 2s + sqrt scaling for file size.
+                -- sqrt grows slowly, so SSD users don't wait excessively for large files,
+                -- while HDD users still get enough time for OBS to stabilize.
+                -- 100MB→2s, 500MB→4s, 1GB→5s, 2GB→7s, 4GB→8s (capped at 15s)
+                local delay_ms = 3000  -- default if size unknown
+                if saved_file_size and saved_file_size > 0 then
+                    local size_mb = saved_file_size / 1024 / 1024
+                    delay_ms = math.floor(2000 + math.sqrt(size_mb) * 150)
+                    delay_ms = math.max(2000, math.min(15000, delay_ms))
+                    dbg("Auto-restart: File size " .. string.format("%.0f", size_mb) .. " MB → adaptive delay " .. delay_ms .. "ms")
+                else
+                    dbg("Auto-restart: File size unknown → default delay " .. delay_ms .. "ms")
+                end
+
+                obs.timer_add(stop_buffer_for_restart, delay_ms)
+            end
+
+        elseif event == obs.OBS_FRONTEND_EVENT_SCREENSHOT_TAKEN then
+            if CONFIG.organize_screenshots then
+                local now = now_ms() / 1000
+                local path = obs.obs_frontend_get_last_screenshot()
+
+                if path then
+                    local raw_game, folder_name
+
+                    -- Cache detection for 2 seconds to handle bursts
+                    if now - STATE.last_detection_time < 2.0 and STATE.cache_folder_name then
+                        raw_game = STATE.cache_raw_game
+                        folder_name = STATE.cache_folder_name
+                        dbg("Using detection cache for rapid screenshot burst")
+                    else
+                        local r, w, s = detect_game()
+                        folder_name = get_game_folder(r, w, s)
+                        raw_game = r
+
+                        -- Update cache
+                        STATE.cache_raw_game = r
+                        STATE.cache_folder_name = folder_name
+                        STATE.last_detection_time = now
+                    end
+
+                    local moved = process_file_with_game(path, folder_name, raw_game, MEDIA.SCREENSHOT)
+
+                    -- Throttle notifications (0.5s) to prevent UI overload
+                    if now - STATE.last_screenshot_notify_time > 0.5 then
+                        if moved then
+                            notify("Screenshot Saved", "Moved to: " .. folder_name)
+                        else
+                            notify("Screenshot Not Moved", "File left in place")
+                        end
+                        STATE.last_screenshot_notify_time = now
+                    end
+
+                    STATE.last_screenshot_time = now
+                end
+            end
+
+
+        elseif event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTING then
+            STATE.chapter_count = 0
+            if CONFIG.organize_recordings then
+                local raw_game, window_title, skip_fallback = detect_game()
+                STATE.recording_game_name = raw_game
+                STATE.recording_folder_name = get_game_folder(raw_game, window_title, skip_fallback)
+                STATE.recording_session_stamp = os.date("%Y-%m-%d %H-%M-%S")
+                STATE.recording_split_index = 0
+                current_recording_file = nil
+
+                if raw_game then
+                    log("Recording starting - Game detected: " .. raw_game .. " -> " .. STATE.recording_folder_name)
+                else
+                    log("Recording starting - No game detected, using: " .. STATE.recording_folder_name)
+                end
+            end
+
+        elseif event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED then
+            if CONFIG.organize_recordings then
+                -- SAFETY: Delay initialization by 0.5s to prevent crash in graphics thread
+                -- during high-stress recording startup period
+                obs.timer_add(delayed_recording_init, 500)
+                log("Recording started - initialization scheduled in 0.5s...")
+            end
+
+        elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
+            if restarting_buffer_active then
+                restarting_buffer_active = false
+                obs.timer_remove(buffer_restart_safety_timeout)  -- Cancel safety timeout
+                dbg("Auto-restart: Buffer stop confirmed. Restarting in 500ms...")
+                obs.timer_add(start_buffer_delayed, 500)
+            end
+            
+        elseif event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
+            if CONFIG.organize_recordings then
+                obs.timer_remove(delayed_recording_init)
+                obs.timer_remove(check_split_files)
+
+                local now = os.time()
+                local diff = now - STATE.last_recording_time
+
+                local path = get_recording_path()
+
+                if diff < CONFIG.duplicate_cooldown then
+                    log("Recording spam detected (" .. string.format("%.1f", diff) .. "s)")
+                    if CONFIG.delete_spam_files and path then
+                        delete_file(path)
+                        log("Duplicate recording deleted")
+                    end
+                    STATE.files_skipped = STATE.files_skipped + 1
+                else
+                    STATE.last_recording_time = now
+
+                    local saved_folder = STATE.recording_folder_name or CONFIG.fallback_folder
+
+                    -- A zero counter means OBS never split this recording, so the final
+                    -- file keeps its normal name and no session folder is created.
+                    local split = nil
+                    if (STATE.recording_split_index or 0) > 0 then
+                        split = {
+                            index = STATE.recording_split_index + 1,
+                            stamp = STATE.recording_session_stamp,
+                        }
+                    end
+
+                    if path then
+                        log("Recording stopped - organizing file")
+                        local moved
+                        if STATE.recording_folder_name then
+                            moved = process_file_with_game(path, STATE.recording_folder_name, STATE.recording_game_name, MEDIA.RECORDING, split)
+                        else
+                            moved = process_file(path, MEDIA.RECORDING, split)
+                        end
+
+                        if moved then
+                            notify("Recording Saved", "Moved to: " .. saved_folder)
+                        else
+                            notify("Recording Not Moved", "File left in place")
+                        end
+                    end
+                end
+
+                disconnect_recording_signals()
+
+                STATE.recording_game_name = nil
+                STATE.recording_folder_name = nil
+                STATE.recording_session_stamp = nil
+                STATE.recording_split_index = 0
+                current_recording_file = nil
+            end
+        end
+    end)
+
+    if not ok then
+        log("ERROR in event handler: " .. tostring(err))
+    end
+end
+
+-- ============================================================================
+-- IMPORT/EXPORT FUNCTIONS
+-- ============================================================================
+
+local function add_custom_mapping(props, p)
+    if not STATE.script_settings then
+        log("ERROR: Settings not loaded yet")
+        return false
+    end
+
+    local process = obs.obs_data_get_string(STATE.script_settings, "new_process_name")
+    local folder = obs.obs_data_get_string(STATE.script_settings, "new_folder_name")
+
+    process = string.gsub(process or "", "^%s+", "")
+    process = string.gsub(process, "%s+$", "")
+    folder = string.gsub(folder or "", "^%s+", "")
+    folder = string.gsub(folder, "%s+$", "")
+
+    if process == "" then
+        log("ERROR: Please enter a process name (from Task Manager)")
+        return false
+    end
+    if folder == "" then
+        log("ERROR: Please enter a folder name")
+        return false
+    end
+
+    local entry = process .. " > " .. folder
+
+    local array = obs.obs_data_get_array(STATE.script_settings, "custom_names")
+    if not array then
+        array = obs.obs_data_array_create()
+    end
+
+    local item = obs.obs_data_create()
+    obs.obs_data_set_string(item, "value", entry)
+    obs.obs_data_array_push_back(array, item)
+    obs.obs_data_release(item)
+
+    obs.obs_data_set_array(STATE.script_settings, "custom_names", array)
+    obs.obs_data_array_release(array)
+
+    obs.obs_data_set_string(STATE.script_settings, "new_process_name", "")
+    obs.obs_data_set_string(STATE.script_settings, "new_folder_name", "")
+
+    load_custom_names(STATE.script_settings)
+
+    log("Added custom mapping: " .. process .. " -> " .. folder)
+    return true
+end
+
+local function get_default_export_path()
+    local home = os.getenv("USERPROFILE") or os.getenv("HOME") or TEMP_DIR
+    return join_path(home, "smart_replay_custom_names.txt")
+end
+
+local function export_custom_names(path)
+    if not STATE.script_settings then
+        log("ERROR: Settings not loaded yet")
+        return false
+    end
+
+    if not path or path == "" then
+        path = get_default_export_path()
+        log("Using default export path: " .. path)
+    end
+
+    local file, err = io.open(path, "w")
+    if not file then
+        log("ERROR: Cannot open file for export: " .. tostring(err))
+        log("Try specifying a different path or check write permissions")
+        return false
+    end
+
+    local count = 0
+    local write_ok, write_err = pcall(function()
+        file:write("# Smart Replay Mover - Custom Names Export\n")
+        file:write("# Format: process_name > Folder Name\n")
+        file:write("# Lines starting with # are comments\n\n")
+
+        local array = obs.obs_data_get_array(STATE.script_settings, "custom_names")
+        if array then
+            local arr_count = obs.obs_data_array_count(array)
+            for i = 0, arr_count - 1 do
+                local item = obs.obs_data_array_item(array, i)
+                local entry = obs.obs_data_get_string(item, "value")
+                obs.obs_data_release(item)
+
+                if entry and entry ~= "" then
+                    file:write(entry .. "\n")
+                    count = count + 1
+                end
+            end
+            obs.obs_data_array_release(array)
+        end
+    end)
+
+    file:close()
+
+    if not write_ok then
+        log("ERROR: Failed to write export file: " .. tostring(write_err))
+        return false
+    end
+
+    if count > 0 then
+        log("Exported " .. count .. " custom name(s) to: " .. path)
+    else
+        log("No custom names to export. File created at: " .. path)
+    end
+    return true
+end
+
+local function import_custom_names(path, props)
+    if not STATE.script_settings then
+        log("ERROR: Settings not loaded yet")
+        return false
+    end
+
+    if not path or path == "" then
+        log("ERROR: Please specify a file path to import from")
+        return false
+    end
+
+    local file, err = io.open(path, "r")
+    if not file then
+        log("ERROR: Cannot open file for import: " .. tostring(err))
+        return false
+    end
+
+    local entries = {}
+    local count = 0
+
+    local read_ok, read_err = pcall(function()
+        for line in file:lines() do
+            local trimmed = string.gsub(line, "^%s+", "")
+            trimmed = string.gsub(trimmed, "%s+$", "")
+
+            if trimmed ~= "" and string.sub(trimmed, 1, 1) ~= "#" then
+                local result, name, mode = parse_custom_entry(trimmed)
+                if result and name and mode then
+                    table.insert(entries, trimmed)
+                    count = count + 1
+                else
+                    log("WARNING: Skipping invalid line: " .. trimmed)
+                end
+            end
+        end
+    end)
+
+    file:close()
+
+    if not read_ok then
+        log("ERROR: Failed to read import file: " .. tostring(read_err))
+        return false
+    end
+
+    if count > 0 then
+        local array = obs.obs_data_get_array(STATE.script_settings, "custom_names")
+        if not array then
+            array = obs.obs_data_array_create()
+        end
+
+        for _, entry in ipairs(entries) do
+            local item = obs.obs_data_create()
+            obs.obs_data_set_string(item, "value", entry)
+            obs.obs_data_array_push_back(array, item)
+            obs.obs_data_release(item)
+        end
+
+        obs.obs_data_set_array(STATE.script_settings, "custom_names", array)
+        obs.obs_data_array_release(array)
+
+        load_custom_names(STATE.script_settings)
+        log("Imported " .. count .. " custom name(s) from: " .. path)
+    else
+        log("No valid entries found in file")
+    end
+
+    return true
+end
+
+local function on_export_clicked(props, p)
+    if not STATE.script_settings then
+        log("ERROR: Settings not loaded yet")
+        return false
+    end
+    local path = obs.obs_data_get_string(STATE.script_settings, "import_export_path")
+    export_custom_names(path)
+    return false
+end
+
+local function on_import_clicked(props, p)
+    if not STATE.script_settings then
+        log("ERROR: Settings not loaded yet")
+        return false
+    end
+    local path = obs.obs_data_get_string(STATE.script_settings, "import_export_path")
+    if path == "" then
+        path = get_default_export_path()
+        log("No path specified, using default: " .. path)
+    end
+    import_custom_names(path, props)
+    return true
+end
+
+local function on_test_notification_clicked(props, p)
+    notify("Test Notification", "This is a test message to check size and sound.")
+    return false
+end
+
+-- ============================================================================
+-- OBS INTERFACE
+-- ============================================================================
+
+function script_description()
+    return [[
+<center>
+<p style="font-size:24px; font-weight:bold; color:#00d4aa;">SMART REPLAY MOVER</p>
+<p style="color:#888;">Automatic Game Clip Organizer v]] .. VERSION .. [[</p>
+</center>
+
+<hr style="border-color:#333;">
+
+<table width="100%">
+<tr><td width="50%" valign="top" align="center">
+<p style="color:#00d4aa; font-weight:bold;">🎮 AUTO-ORGANIZE</p>
+<p style="font-size:11px;">
+Detects active game automatically<br>
+Creates game-named folders<br>
+Replays, recordings & screenshots
+</p>
+</td><td width="50%" valign="top" align="center">
+<p style="color:#ff6b6b; font-weight:bold;">🛡️ SMART & SAFE</p>
+<p style="font-size:11px;">
+Spam protection with cooldown<br>
+Custom game name mappings<br>
+Optional date subfolders
+</p>
+</td></tr>
+</table>
+
+<center>
+<p style="font-size:11px; color:#666; margin-top:10px;">
+Made by <b>SlonickLab</b> • <a href="https://github.com/SlonickLab/Smart-Replay-Mover" style="color:#00d4aa;">GitHub</a>
+</p>
+</center>
+]]
+end
+
+-- Helper function to compare semantic versions
+-- Returns true if new > old
+local function compare_versions(new, old)
+    local new_m, new_n, new_p = new:match("(%d+)%.(%d+)%.?(%d*)")
+    local old_m, old_n, old_p = old:match("(%d+)%.(%d+)%.?(%d*)")
+    new_m, new_n, new_p = tonumber(new_m or 0), tonumber(new_n or 0), tonumber(new_p or 0)
+    old_m, old_n, old_p = tonumber(old_m or 0), tonumber(old_n or 0), tonumber(old_p or 0)
+    
+    if new_m > old_m then return true end
+    if new_m < old_m then return false end
+    if new_n > old_n then return true end
+    if new_n < old_n then return false end
+    return new_p > old_p
+end
+
+-- Helper function to read configuration from settings
+local function read_config(settings)
+    STATE.script_settings = settings
+
+    CONFIG.add_game_prefix = obs.obs_data_get_bool(settings, "add_game_prefix")
+    CONFIG.organize_screenshots = obs.obs_data_get_bool(settings, "organize_screenshots")
+    CONFIG.organize_recordings = obs.obs_data_get_bool(settings, "organize_recordings")
+    CONFIG.group_split_recordings = obs.obs_data_get_bool(settings, "group_split_recordings")
+    CONFIG.use_date_subfolders = obs.obs_data_get_bool(settings, "use_date_subfolders")
+    CONFIG.folder_template = obs.obs_data_get_string(settings, "folder_template")
+    CONFIG.fallback_folder = obs.obs_data_get_string(settings, "fallback_folder")
+    CONFIG.duplicate_cooldown = obs.obs_data_get_double(settings, "duplicate_cooldown")
+    CONFIG.delete_spam_files = obs.obs_data_get_bool(settings, "delete_spam_files")
+    CONFIG.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
+    CONFIG.show_notifications = obs.obs_data_get_bool(settings, "show_notifications")
+    CONFIG.play_sound = obs.obs_data_get_bool(settings, "play_sound")
+    CONFIG.notification_scale = math.floor(obs.obs_data_get_double(settings, "notification_scale"))
+    CONFIG.use_quiet_sound = obs.obs_data_get_bool(settings, "use_quiet_sound")
+    CONFIG.single_notification = obs.obs_data_get_bool(settings, "single_notification")
+    CONFIG.notification_sound = obs.obs_data_get_string(settings, "notification_sound")
+    -- One-time migration: fold the old "Use Quiet Sound" checkbox into the sound dropdown.
+    if CONFIG.use_quiet_sound and (CONFIG.notification_sound == "" or CONFIG.notification_sound == "default") then
+        CONFIG.notification_sound = "quiet"
+        obs.obs_data_set_string(settings, "notification_sound", "quiet")
+        obs.obs_data_set_bool(settings, "use_quiet_sound", false)
+    end
+    if CONFIG.notification_sound == "" then CONFIG.notification_sound = "default" end
+    STATE.notification_sounds = list_notification_sounds()
+    CONFIG.notification_duration = obs.obs_data_get_double(settings, "notification_duration")
+    CONFIG.enable_thumbnails = obs.obs_data_get_bool(settings, "enable_thumbnails")
+    CONFIG.thumbnail_offset = obs.obs_data_get_double(settings, "thumbnail_offset")
+    CONFIG.ffmpeg_path = obs.obs_data_get_string(settings, "ffmpeg_path")
+    CONFIG.restart_buffer_after_save = obs.obs_data_get_bool(settings, "restart_buffer_after_save")
+    CONFIG.auto_start_buffer = obs.obs_data_get_bool(settings, "auto_start_buffer")
+    CONFIG.scan_all_processes = obs.obs_data_get_bool(settings, "scan_all_processes")
+    CONFIG.notification_position = obs.obs_data_get_string(settings, "notification_position")
+    CONFIG.rbp_mode = obs.obs_data_get_string(settings, "rbp_mode")
+    if CONFIG.rbp_mode == "" then CONFIG.rbp_mode = "auto" end
+    CONFIG.strip_trimmed_suffix = obs.obs_data_get_bool(settings, "strip_trimmed_suffix")
+
+    if CONFIG.fallback_folder == "" then
+        CONFIG.fallback_folder = "Desktop"
+    end
+end
+
+-- Replay Buffer Pro presence check - drives the deferred-queue behavior.
+-- "auto" asks OBS whether the plugin module is loaded; "on"/"off" force it.
+local function evaluate_rbp_mode()
+    local active = false
+    if CONFIG.rbp_mode == "on" then
+        active = true
+    elseif CONFIG.rbp_mode == "auto" then
+        local ok, mod = pcall(function()
+            if obs.obs_get_module then
+                return obs.obs_get_module("replay-buffer-pro")
+            end
+            return nil
+        end)
+        active = ok and mod ~= nil
+    end
+    if active ~= STATE.rbp_active then
+        log("Replay Buffer Pro integration: " .. (active and "ACTIVE" or "inactive") .. " (mode: " .. tostring(CONFIG.rbp_mode) .. ")")
+    else
+        dbg("Replay Buffer Pro integration: " .. (active and "ACTIVE" or "inactive") .. " (mode: " .. tostring(CONFIG.rbp_mode) .. ")")
+    end
+    STATE.rbp_active = active
+end
+
+-- Parse result of startup auto-update check
+local function parse_startup_update_result()
+    obs.timer_remove(parse_startup_update_result)
+    
+    local file = io.open(GITHUB_VERSION_FILE, "r")
+    if not file then
+        STATE.startup_update_status = "⚠️ Update check failed"
+        STATE.startup_update_check_done = true
+        return
+    end
+    
+    local content = file:read("*a")
+    file:close()
+    pcall(os.remove, GITHUB_VERSION_FILE)
+    
+    if not content or not content:match("^-- Smart Replay Mover") then
+        STATE.startup_update_status = "⚠️ Update check failed"
+    else
+        local latest_version = content:match("Smart Replay Mover v?(%d+%.%d+%.?[%d]*)")
+        if latest_version then
+            latest_version = latest_version:gsub("^%s*(.-)%s*$", "%1")
+            
+            if latest_version == VERSION then
+                STATE.startup_update_status = "✅ Up to date (v" .. VERSION .. ")"
+            elseif compare_versions(latest_version, VERSION) then
+                STATE.startup_update_status = "🆕 New version available: v" .. latest_version
+            else
+                STATE.startup_update_status = "✅ Dev version (v" .. VERSION .. ")"
+            end
+        else
+            STATE.startup_update_status = "⚠️ Parse error"
+        end
+    end
+    
+    STATE.startup_update_check_done = true
+    log("Update Check: " .. STATE.startup_update_status)
+    
+    -- Trigger UI refresh by toggling hidden property
+    if STATE.script_settings then
+        local current = obs.obs_data_get_bool(STATE.script_settings, "__startup_refresh")
+        obs.obs_data_set_bool(STATE.script_settings, "__startup_refresh", not current)
+    end
+end
+
+-- Linux has no PowerShell, so the update check goes through curl or wget instead.
+-- Returns nil on Windows, so nothing here can spawn a visible console there.
+local function linux_update_tool()
+    if kernel32 then return nil end
+    if command_exists("curl") then return "curl" end
+    if command_exists("wget") then return "wget" end
+    return nil
+end
+
+-- Callback for refresh button - dynamically updates the status text
+local function refresh_update_status(props, p)
+    -- Get the update_info property and change its description to current status
+    local update_prop = obs.obs_properties_get(props, "update_info")
+    if update_prop then
+        obs.obs_property_set_description(update_prop, STATE.startup_update_status)
+    end
+    
+    -- Show/hide the download button based on whether update is available
+    local link_prop = obs.obs_properties_get(props, "open_releases_btn")
+    if link_prop then
+        obs.obs_property_set_visible(link_prop, STATE.startup_update_status:match("🆕") ~= nil)
+    end
+    
+    return true
+end
+
+-- Callback for download button - opens releases page in browser (silent, no terminal window)
+local function open_releases_url(props, p)
+    if kernel32 then
+        local cmd = 'powershell -WindowStyle Hidden -Command "Start-Process \'' .. GITHUB_RELEASES_URL .. '\'"'
+        kernel32.WinExec(cmd, 0)
+    elseif command_exists("xdg-open") then
+        run_shell_command("xdg-open " .. quote_shell_arg(GITHUB_RELEASES_URL) .. " >/dev/null 2>&1 &")
+    else
+        log("Download the update here: " .. GITHUB_RELEASES_URL)
+    end
+    return false
+end
+
+-- Show/hide RBP-specific options depending on the selected mode (modified callback)
+local function on_rbp_mode_changed(props, property, settings)
+    pcall(function()
+        local visible = (obs.obs_data_get_string(settings, "rbp_mode") ~= "off")
+        local function set_vis(name)
+            local p = obs.obs_properties_get(props, name)
+            if not p then
+                -- obs_properties_get may not search inside groups on all versions
+                local grp = obs.obs_properties_get(props, "rbp_section")
+                local content = grp and obs.obs_property_group_content(grp)
+                p = content and obs.obs_properties_get(content, name)
+            end
+            if p then obs.obs_property_set_visible(p, visible) end
+        end
+        set_vis("strip_trimmed_suffix")
+        set_vis("rbp_help")
+    end)
+    return true -- refresh UI
+end
+
+-- Fold the legacy use_date_subfolders flag into the template as {yearmonth}.
+local function migrate_legacy_date_setting(settings)
+    if not obs.obs_data_get_bool(settings, "use_date_subfolders") then return false end
+    local tmpl = obs.obs_data_get_string(settings, "folder_template")
+    if not tmpl or tmpl == "" then tmpl = "{game}" end
+    if not tmpl:lower():find("{yearmonth}", 1, true) then
+        tmpl = tmpl .. "/{yearmonth}"
+        obs.obs_data_set_string(settings, "folder_template", tmpl)
+    end
+    obs.obs_data_set_bool(settings, "use_date_subfolders", false)
+    log("Migrated legacy monthly subfolders into folder template: " .. tmpl)
+    return true
+end
+
+local function on_migrate_template_clicked(props, property)
+    local settings = STATE.script_settings
+    if not settings or not migrate_legacy_date_setting(settings) then return false end
+    read_config(settings)
+
+    -- obs_properties_get may not search inside groups on all versions.
+    local function hide(name)
+        local p = obs.obs_properties_get(props, name)
+        if not p then
+            local grp = obs.obs_properties_get(props, "template_section")
+            local content = grp and obs.obs_property_group_content(grp)
+            p = content and obs.obs_properties_get(content, name)
+        end
+        if p then obs.obs_property_set_visible(p, false) end
+    end
+    hide("use_date_subfolders")
+    hide("migrate_info")
+    hide("migrate_template_btn")
+    return true
+end
+
+function script_properties()
+    local props = obs.obs_properties_create()
+
+    -- UPDATE STATUS (FIRST ELEMENT - shown at top of UI)
+    obs.obs_properties_add_text(props, "update_info", STATE.startup_update_status, obs.OBS_TEXT_INFO)
+    
+    -- Download button - opens releases page in browser (hidden until update available)
+    local download_btn = obs.obs_properties_add_button(props, "open_releases_btn", "📥 Download Update", open_releases_url)
+    obs.obs_property_set_visible(download_btn, STATE.startup_update_status:match("🆕") ~= nil)
+    
+    -- Refresh button - clicking updates the status display
+    obs.obs_properties_add_button(props, "refresh_status_btn", "🔄 Refresh Status", refresh_update_status)
+    obs.obs_properties_add_text(props, "refresh_hint", "Click after ~4 seconds to see update status", obs.OBS_TEXT_INFO)
+
+
+    -- FILE NAMING GROUP
+    local naming_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(naming_group, "add_game_prefix", "✏️  Add game name prefix to filename")
+    obs.obs_properties_add_text(naming_group, "fallback_folder", "📂  Fallback folder name", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_group(props, "naming_section", "📁  FILE NAMING", obs.OBS_GROUP_NORMAL, naming_group)
+
+    -- CUSTOM NAMES GROUP
+    local custom_group = obs.obs_properties_create()
+    obs.obs_properties_add_text(custom_group, "custom_names_help", "Custom names have HIGHEST priority! Format: game > Folder | +keywords > Folder | *text* > Folder | game > / or . (no folder)", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(custom_group, "new_process_name", "🎯  Game (process, +keywords, or *text*)", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(custom_group, "new_folder_name", "📁  Folder name", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_button(custom_group, "add_mapping_btn", "➕  Add", add_custom_mapping)
+    obs.obs_properties_add_editable_list(custom_group, "custom_names", "Your mappings", obs.OBS_EDITABLE_LIST_TYPE_STRINGS, nil, nil)
+    obs.obs_properties_add_group(props, "custom_section", "🎮  CUSTOM NAMES (Highest Priority)", obs.OBS_GROUP_NORMAL, custom_group)
+
+    -- BACKUP GROUP
+    local backup_group = obs.obs_properties_create()
+    obs.obs_properties_add_path(backup_group, "import_export_path", "📄  File path (optional)", obs.OBS_PATH_FILE_SAVE, "Text files (*.txt)", nil)
+    obs.obs_properties_add_button(backup_group, "import_btn", "📥  Import", on_import_clicked)
+    obs.obs_properties_add_button(backup_group, "export_btn", "📤  Export", on_export_clicked)
+    obs.obs_properties_add_group(props, "backup_section", "💾  BACKUP", obs.OBS_GROUP_NORMAL, backup_group)
+
+    -- BUFFER CONTROL GROUP
+    local buffer_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(buffer_group, "restart_buffer_after_save", "🔄  Auto-restart Replay Buffer after save (Prevent Overlap)")
+    obs.obs_properties_add_bool(buffer_group, "auto_start_buffer", "▶️  Auto-start Replay Buffer on OBS launch")
+    obs.obs_properties_add_text(buffer_group, "smart_save_help", "💡 Smart Save: Go to OBS Settings → Hotkeys → find 'Smart Save Replay' and assign your key. Shows instant 'Saving...' feedback!", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_group(props, "buffer_section", "🔄  BUFFER CONTROL", obs.OBS_GROUP_NORMAL, buffer_group)
+
+    -- REPLAY BUFFER PRO GROUP (dynamic: RBP options hide when Mode = Off)
+    local rbp_group = obs.obs_properties_create()
+    local rbp_mode_prop = obs.obs_properties_add_list(rbp_group, "rbp_mode", "🔌  Mode", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(rbp_mode_prop, "Auto-Detect", "auto")
+    obs.obs_property_list_add_string(rbp_mode_prop, "Always On", "on")
+    obs.obs_property_list_add_string(rbp_mode_prop, "Off", "off")
+    local rbp_strip_prop = obs.obs_properties_add_bool(rbp_group, "strip_trimmed_suffix", "✂️  Remove \"_trimmed\" suffix when organizing")
+    local rbp_help_prop = obs.obs_properties_add_text(rbp_group, "rbp_help", "Waits for Replay Buffer Pro to finish trimming, then organizes the final clip. Auto-Detect activates only when the plugin is installed.", obs.OBS_TEXT_INFO)
+    obs.obs_property_set_modified_callback(rbp_mode_prop, on_rbp_mode_changed)
+    local rbp_visible = (CONFIG.rbp_mode ~= "off")
+    obs.obs_property_set_visible(rbp_strip_prop, rbp_visible)
+    obs.obs_property_set_visible(rbp_help_prop, rbp_visible)
+    obs.obs_properties_add_group(props, "rbp_section", "🎬  REPLAY BUFFER PRO", obs.OBS_GROUP_NORMAL, rbp_group)
+
+    -- FOLDER TEMPLATES GROUP
+    local template_group = obs.obs_properties_create()
+    obs.obs_properties_add_text(template_group, "folder_template", "🧩  Folder template", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(template_group, "folder_template_help",
+        "Tokens: {game} {type} {year} {month} {day} {date} {yearmonth} {hour} {min}. {type} is Replays, Recordings or Screenshots. ONLY / creates a subfolder: {game}/{type} gives two folders, {game}-{type} gives one folder called \"Elden Ring-Replays\". See README.",
+        obs.OBS_TEXT_INFO)
+    -- Show the legacy controls only while the old flag is set. script_load migrates
+    -- automatically now, so this is a fallback for the case where that did not run.
+    -- Keep it until use_date_subfolders itself is removed.
+    if CONFIG.use_date_subfolders then
+        obs.obs_properties_add_bool(template_group, "use_date_subfolders", "📅  Monthly subfolders (legacy)")
+        obs.obs_properties_add_text(template_group, "migrate_info",
+            "Legacy monthly subfolders is on. Migrate folds it into the template as {yearmonth} (one-time).",
+            obs.OBS_TEXT_INFO)
+        obs.obs_properties_add_button(template_group, "migrate_template_btn",
+            "⬆️  Migrate monthly subfolders into template", on_migrate_template_clicked)
+    end
+    obs.obs_properties_add_group(props, "template_section", "🧩  FOLDER TEMPLATES", obs.OBS_GROUP_NORMAL, template_group)
+
+    -- ORGANIZATION GROUP
+    local folder_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(folder_group, "organize_screenshots", "📸  Also organize screenshots")
+    obs.obs_properties_add_bool(folder_group, "organize_recordings", "🎬  Organize recordings (Start/Stop Recording)")
+    obs.obs_properties_add_bool(folder_group, "group_split_recordings", "🗂️  Group split recordings into a session folder")
+    obs.obs_properties_add_text(folder_group, "group_split_help",
+        "Only affects recordings that OBS actually split. Each session gets its own folder named after its start time, and the parts inside are numbered Part 01, Part 02. Unsplit recordings are untouched.",
+        obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_bool(folder_group, "scan_all_processes", "🔍  Detect game by scanning all running processes")
+    obs.obs_properties_add_text(folder_group, "scan_all_processes_help", "Detects background games when focused on Discord or Desktop (acts as a smart fallback).", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_group(props, "folder_section", "🗂️  ORGANIZATION", obs.OBS_GROUP_NORMAL, folder_group)
+
+    -- SPAM PROTECTION GROUP
+    local spam_group = obs.obs_properties_create()
+    obs.obs_properties_add_float_slider(spam_group, "duplicate_cooldown", "⏱️  Cooldown between saves (seconds)", 0, 30, 0.5)
+    obs.obs_properties_add_bool(spam_group, "delete_spam_files", "🗑️  Auto-delete duplicate files")
+    obs.obs_properties_add_group(props, "spam_section", "🛡️  SPAM PROTECTION", obs.OBS_GROUP_NORMAL, spam_group)
+
+    -- NOTIFICATIONS GROUP
+    local notify_group = obs.obs_properties_create()
+    obs.obs_properties_add_text(notify_group, "notify_help", "Visual popup works only in Borderless Windowed games!", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_bool(notify_group, "show_notifications", "🖼️  Show visual popup (Borderless Windowed only)")
+    obs.obs_properties_add_bool(notify_group, "play_sound", "🔊  Play notification sound (works in Fullscreen too)")
+    obs.obs_properties_add_bool(notify_group, "single_notification", "Single notification (show only \"Saving...\")")
+    
+    local p_scale = obs.obs_properties_add_float_slider(notify_group, "notification_scale", "📏  Scale %", 100.0, 300.0, 10.0)
+    
+    local p_pos = obs.obs_properties_add_list(notify_group, "notification_position", "📍  Position", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(p_pos, "↗ Top Right", "top_right")
+    obs.obs_property_list_add_string(p_pos, "↖ Top Left", "top_left")
+    obs.obs_property_list_add_string(p_pos, "↘ Bottom Right", "bottom_right")
+    obs.obs_property_list_add_string(p_pos, "↙ Bottom Left", "bottom_left")
+    
+    local p_snd = obs.obs_properties_add_list(notify_group, "notification_sound", "🔉  Notification sound", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(p_snd, "Default", "default")
+    obs.obs_property_list_add_string(p_snd, "Quiet", "quiet")
+    for _, wav in ipairs(list_notification_sounds()) do
+        obs.obs_property_list_add_string(p_snd, wav, wav)
+    end
+    obs.obs_property_list_add_string(p_snd, "🎲 Random", "random")
+
+    obs.obs_properties_add_float_slider(notify_group, "notification_duration", "⏱️  Popup duration (seconds)", 1.0, 10.0, 0.5)
+    
+    obs.obs_properties_add_button(notify_group, "test_notification_btn", "🔊  Test Notification", on_test_notification_clicked)
+    
+    obs.obs_properties_add_group(props, "notify_section", "🔔  NOTIFICATIONS", obs.OBS_GROUP_NORMAL, notify_group)
+
+    -- TOOLS GROUP
+    local tools_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(tools_group, "debug_mode", "🐛  Show debug messages in console")
+
+    -- OS MODE SELECTOR (inside Tools group)
+    local os_list = obs.obs_properties_add_list(tools_group, "os_mode",
+        "🖥️  Operating System Mode",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(os_list, "Auto-Detect", "auto")
+    obs.obs_property_list_add_string(os_list, "Windows", "windows")
+    obs.obs_property_list_add_string(os_list, "Linux", "linux")
+
+    obs.obs_property_set_modified_callback(os_list, function(props, prop, settings)
+        local mode = obs.obs_data_get_string(settings, "os_mode")
+        local is_win = IS_WINDOWS_REAL
+        if mode == "windows" then is_win = true
+        elseif mode == "linux" then is_win = false end
+
+        -- Helper to set visibility safely
+        local function set_vis(name, visible)
+            local p = obs.obs_properties_get(props, name)
+            if p then obs.obs_property_set_visible(p, visible) end
+        end
+
+        -- Windows-only: process scanning (uses Toolhelp32)
+        set_vis("scan_all_processes", is_win)
+        set_vis("scan_all_processes_help", is_win)
+
+        -- Windows-only: Win32 visual popup settings
+        set_vis("notification_scale", is_win)
+        set_vis("notification_position", is_win)
+        set_vis("notify_help", is_win)
+
+        -- Update checker: PowerShell on Windows, curl or wget on Linux
+        local can_update = is_win or linux_update_tool() ~= nil
+        set_vis("refresh_status_btn", can_update)
+        set_vis("refresh_hint", can_update)
+        set_vis("open_releases_btn", can_update)
+
+        -- Windows-only: FFmpeg path filter mentions .exe
+        local ffmpeg_prop = obs.obs_properties_get(props, "ffmpeg_path")
+        if ffmpeg_prop then
+            if is_win then
+                obs.obs_property_set_description(ffmpeg_prop, "\u{1F4C2}  FFmpeg Executable Path (ffmpeg.exe)")
+            else
+                obs.obs_property_set_description(ffmpeg_prop, "\u{1F4C2}  FFmpeg Path (/usr/bin/ffmpeg)")
+            end
+        end
+
+        return true
+    end)
+
+    obs.obs_properties_add_group(props, "tools_section", "🔧  TOOLS & DEBUG", obs.OBS_GROUP_NORMAL, tools_group)
+
+    -- FFMPEG GROUP (Advanced)
+    local ffmpeg_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(ffmpeg_group, "enable_thumbnails", "🖼️  Embed Video Dictionary (Thumbnail)")
+    obs.obs_properties_add_float_slider(ffmpeg_group, "thumbnail_offset", "⏱️  Thumbnail Offset (seconds from end)", 1.0, 60.0, 1.0)
+    obs.obs_properties_add_path(ffmpeg_group, "ffmpeg_path", "📂  FFmpeg Executable Path (ffmpeg.exe)", obs.OBS_PATH_FILE, "Executables (*.exe);;All Files (*.*)", nil)
+    obs.obs_properties_add_text(ffmpeg_group, "ffmpeg_info", "Note: Embedded thumbnails support MP4 and MKV. MP4 safety checks also require ffprobe (normally included with FFmpeg).", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_group(props, "ffmpeg_section", "🎬  FFMPEG THUMBNAILS (Advanced)", obs.OBS_GROUP_NORMAL, ffmpeg_group)
+
+    -- Apply initial visibility based on detected OS
+    if not IS_WINDOWS then
+        local function hide(name)
+            local p = obs.obs_properties_get(props, name)
+            if p then obs.obs_property_set_visible(p, false) end
+        end
+        hide("scan_all_processes")
+        hide("scan_all_processes_help")
+        hide("notification_scale")
+        hide("notification_position")
+        hide("notify_help")
+        if not linux_update_tool() then
+            hide("refresh_status_btn")
+            hide("refresh_hint")
+            hide("open_releases_btn")
+        end
+    end
+
+    return props
+end
+
+function script_defaults(settings)
+    obs.obs_data_set_default_string(settings, "os_mode", "auto")
+    obs.obs_data_set_default_bool(settings, "add_game_prefix", true)
+    obs.obs_data_set_default_bool(settings, "organize_screenshots", true)
+    obs.obs_data_set_default_bool(settings, "organize_recordings", true)
+    obs.obs_data_set_default_bool(settings, "group_split_recordings", false)
+    obs.obs_data_set_default_bool(settings, "use_date_subfolders", false)
+    obs.obs_data_set_default_string(settings, "folder_template", "{game}")
+    obs.obs_data_set_default_string(settings, "fallback_folder", "Desktop")
+    obs.obs_data_set_default_double(settings, "duplicate_cooldown", 5.0)
+    obs.obs_data_set_default_bool(settings, "delete_spam_files", true)
+    obs.obs_data_set_default_bool(settings, "debug_mode", false)
+    obs.obs_data_set_default_bool(settings, "show_notifications", true)
+    obs.obs_data_set_default_bool(settings, "play_sound", false)
+    obs.obs_data_set_default_double(settings, "notification_scale", 100.0)
+    obs.obs_data_set_default_bool(settings, "use_quiet_sound", false)
+    obs.obs_data_set_default_bool(settings, "single_notification", false)
+    obs.obs_data_set_default_string(settings, "notification_sound", "default")
+    obs.obs_data_set_default_double(settings, "notification_duration", 3.0)
+    obs.obs_data_set_default_bool(settings, "enable_thumbnails", false)
+    obs.obs_data_set_default_double(settings, "thumbnail_offset", 10.0)
+    obs.obs_data_set_default_string(settings, "ffmpeg_path", "")
+    obs.obs_data_set_default_bool(settings, "restart_buffer_after_save", false)
+    obs.obs_data_set_default_bool(settings, "auto_start_buffer", false)
+    obs.obs_data_set_default_bool(settings, "scan_all_processes", false)
+    obs.obs_data_set_default_string(settings, "notification_position", "top_right")
+    obs.obs_data_set_default_string(settings, "rbp_mode", "auto")
+    obs.obs_data_set_default_bool(settings, "strip_trimmed_suffix", true)
+end
+
+function script_update(settings)
+    CONFIG.os_mode = obs.obs_data_get_string(settings, "os_mode")
+    if CONFIG.os_mode == "windows" then IS_WINDOWS = true
+    elseif CONFIG.os_mode == "linux" then IS_WINDOWS = false
+    else IS_WINDOWS = IS_WINDOWS_REAL end
+    
+    WINDOWS_FFI_AVAILABLE = IS_WINDOWS and ffi ~= nil and user32 ~= nil
+    VISUAL_NOTIFICATIONS_SUPPORTED = WINDOWS_FFI_AVAILABLE
+
+    read_config(settings)
+    evaluate_rbp_mode()
+    
+    load_custom_names(settings)
+
+    local exact_count = 0
+    for _ in pairs(CUSTOM_NAMES_EXACT) do exact_count = exact_count + 1 end
+    local keywords_count = #CUSTOM_NAMES_KEYWORDS
+    local contains_count = #CUSTOM_NAMES_CONTAINS
+    local total_count = exact_count + keywords_count + contains_count
+    if total_count > 0 then
+        dbg("Loaded " .. total_count .. " custom name mapping(s) (" .. exact_count .. " exact, " .. keywords_count .. " keywords, " .. contains_count .. " contains)")
+    end
+end
+
+-- Smart Save Hotkey state
+local smart_save_hotkey_id = nil
+
+-- Smart Save Hotkey callback.
+-- notify() is now thread-safe (pushes to queue only, no Win32 calls).
+-- obs_frontend_replay_buffer_save() is thread-safe (uses OBS signal handler internally).
+-- Both can be called directly from the hotkey thread -- no timer deferral needed.
+local function smart_save_replay(pressed)
+    if not pressed then return end
+
+    local ok, err = pcall(function()
+        -- Queue "Saving..." -- displayed by process_notification_queue on the graphics thread.
+        -- On fast systems (NVMe), save completes before the 50ms timer fires, so the
+        -- optimization in process_notification_queue skips it and shows "Clip Saved" directly.
+        notify("Saving...", "Replay buffer saving...")
+        dbg("Smart Save: queued instant notification, triggering save")
+        obs.obs_frontend_replay_buffer_save()
+    end)
+
+    if not ok then
+        log("ERROR in Smart Save hotkey: " .. tostring(err))
+    end
+end
+
+-- OBS fires no event for its own "Add Chapter Marker" hotkey, so a script cannot react
+-- to it. This hotkey places the marker itself and reports the result either way.
+local function smart_add_chapter(pressed)
+    if not pressed then return end
+
+    local ok, err = pcall(function()
+        if not obs.obs_frontend_recording_add_chapter then
+            notify("Chapter Not Added", "Needs OBS 30.2 or newer")
+        elseif not obs.obs_frontend_recording_active() then
+            notify("Chapter Not Added", "Recording is not running")
+        elseif obs.obs_frontend_recording_paused() then
+            notify("Chapter Not Added", "Recording is paused")
+        else
+            local n = (STATE.chapter_count or 0) + 1
+            -- Named after the counter so the chapter in the file matches the notification.
+            if obs.obs_frontend_recording_add_chapter("Chapter " .. n) then
+                STATE.chapter_count = n
+                notify("Chapter " .. n, "Marker added")
+            else
+                notify("Chapter Not Added", "Needs Hybrid MP4 or Hybrid MOV")
+            end
+        end
+    end)
+
+    if not ok then
+        log("ERROR in Smart Add Chapter hotkey: " .. tostring(err))
+    end
+end
+
+function script_load(settings)
+    -- Reset update status on every load so stale results from previous
+    -- sessions don't persist (users would see old "✅ Up to date" forever)
+    STATE.startup_update_status = "📦 v" .. VERSION
+    STATE.startup_update_check_done = false
+
+    destroy_orphaned_notifications()
+
+    -- Fold the legacy monthly-subfolders flag into the folder template automatically.
+    -- It used to happen only when the user found and clicked the Migrate button, so
+    -- anyone who upgraded and never opened the settings was still relying on the old flag.
+    migrate_legacy_date_setting(settings)
+
+    read_config(settings)
+    evaluate_rbp_mode()
+
+    load_custom_names(settings)
+
+    obs.obs_frontend_add_event_callback(on_event)
+
+    -- Start the notification queue processor on the graphics thread.
+    -- This is the ONLY place that calls show_notification() / play_notification_sound().
+    -- All notify() calls from any thread are safe because they only push to the queue.
+    obs.timer_add(process_notification_queue, 50)
+
+    -- Register Smart Save Replay hotkey
+    smart_save_hotkey_id = obs.obs_hotkey_register_frontend(
+        "smart_save_replay",
+        "Smart Save Replay (Instant Notification)",
+        smart_save_replay
+    )
+    
+    -- Load saved hotkey binding
+    local hotkey_save_array = obs.obs_data_get_array(settings, "smart_save_replay_hotkey")
+    if hotkey_save_array then
+        obs.obs_hotkey_load(smart_save_hotkey_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+    dbg("Smart Save Replay hotkey registered")
+
+    STATE.chapter_hotkey_id = obs.obs_hotkey_register_frontend(
+        "smart_add_chapter",
+        "Smart Add Chapter Marker (With Notification)",
+        smart_add_chapter
+    )
+    local chapter_save_array = obs.obs_data_get_array(settings, "smart_add_chapter_hotkey")
+    if chapter_save_array then
+        obs.obs_hotkey_load(STATE.chapter_hotkey_id, chapter_save_array)
+        obs.obs_data_array_release(chapter_save_array)
+    end
+    dbg("Smart Add Chapter Marker hotkey registered")
+
+    local exact_count = 0
+    for _ in pairs(CUSTOM_NAMES_EXACT) do exact_count = exact_count + 1 end
+    local custom_count = exact_count + #CUSTOM_NAMES_KEYWORDS + #CUSTOM_NAMES_CONTAINS
+
+    -- Count embedded database entries
+    local db_count = 0
+    if GAME_DATABASE then
+        for _ in pairs(GAME_DATABASE) do db_count = db_count + 1 end
+    end
+
+    log("Smart Replay Mover v" .. VERSION .. " loaded (GPL v3 - github.com/SlonickLab/Smart-Replay-Mover)")
+    log("Database: " .. db_count .. " games | Custom: " .. custom_count .. " mappings")
+    log("Prefix: " .. (CONFIG.add_game_prefix and "ON" or "OFF") ..
+        " | Recordings: " .. (CONFIG.organize_recordings and "ON" or "OFF") ..
+        " | Fallback: " .. CONFIG.fallback_folder)
+    
+    -- AUTO UPDATE CHECK (runs async, result ready by UI open)
+    local linux_tool = linux_update_tool()
+    if kernel32 then
+        pcall(function()
+            if obs.os_file_exists(GITHUB_VERSION_FILE) then
+                os.remove(GITHUB_VERSION_FILE)
+            end
+            math.randomseed(os.time())
+            local cache_buster = "?t=" .. os.time() .. math.random(1000, 9999)
+            local cmd = string.format(
+                'powershell -Command "Invoke-WebRequest -Uri \'%s%s\' -OutFile \'%s\'"',
+                GITHUB_RAW_URL, cache_buster, GITHUB_VERSION_FILE
+            )
+            kernel32.WinExec(cmd, 0)
+            obs.timer_add(parse_startup_update_result, 4000)
+            dbg("Auto update check started")
+        end)
+    elseif linux_tool then
+        pcall(function()
+            -- A leftover file from an earlier session would be parsed if this download failed.
+            if obs.os_file_exists(GITHUB_VERSION_FILE) then
+                os.remove(GITHUB_VERSION_FILE)
+            end
+            math.randomseed(os.time())
+            local url = GITHUB_RAW_URL .. "?t=" .. os.time() .. math.random(1000, 9999)
+            local out = quote_shell_arg(GITHUB_VERSION_FILE)
+            local cmd = linux_tool == "curl"
+                and ("curl -fsSL --max-time 15 -o " .. out .. " " .. quote_shell_arg(url))
+                or ("wget -q -T 15 -O " .. out .. " " .. quote_shell_arg(url))
+            run_shell_command(cmd .. " </dev/null >/dev/null 2>&1 &")
+            obs.timer_add(parse_startup_update_result, 4000)
+            dbg("Auto update check started (" .. linux_tool .. ")")
+        end)
+    else
+        STATE.startup_update_status = "⚠️ Check unavailable"
+        STATE.startup_update_check_done = true
+    end
+
+    -- AUTO-START REPLAY BUFFER (5s delay for OBS to fully initialize)
+    if CONFIG.auto_start_buffer then
+        obs.timer_add(auto_start_buffer_on_load, 5000)
+        dbg("Auto-start buffer scheduled in 5s")
+    end
+end
+
+-- Save hotkey binding when settings are saved
+function script_save(settings)
+    if smart_save_hotkey_id then
+        local hotkey_save_array = obs.obs_hotkey_save(smart_save_hotkey_id)
+        obs.obs_data_set_array(settings, "smart_save_replay_hotkey", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+    if STATE.chapter_hotkey_id then
+        local chapter_save_array = obs.obs_hotkey_save(STATE.chapter_hotkey_id)
+        obs.obs_data_set_array(settings, "smart_add_chapter_hotkey", chapter_save_array)
+        obs.obs_data_array_release(chapter_save_array)
+    end
+end
+
+function script_unload()
+    obs.timer_remove(check_split_files)
+    obs.timer_remove(notification_timer_callback)
+    obs.timer_remove(process_notification_queue)   -- Stop notification queue processor
+    obs.timer_remove(delayed_recording_init)
+    obs.timer_remove(parse_startup_update_result)  -- Stop startup update check if still running
+    obs.timer_remove(auto_start_buffer_on_load)    -- Cancel auto-start if still pending
+    obs.timer_remove(stop_buffer_for_restart)       -- Cancel pending buffer stop
+    obs.timer_remove(buffer_restart_safety_timeout) -- Cancel safety restart timeout
+    obs.timer_remove(verify_buffer_started)         -- Cancel buffer verification retries
+    obs.timer_remove(start_buffer_delayed)           -- Cancel pending buffer start
+    obs.timer_remove(process_move_queue)             -- Stop deferred move queue
+    if #STATE.pending_moves > 0 then
+        log("WARNING: " .. #STATE.pending_moves .. " pending replay move(s) dropped - files remain in the recordings folder")
+    end
+    STATE.pending_moves = {}
+    STATE.move_timer_running = false
+    STATE.notification_timer_should_stop = true
+    notification_queue = {}                        -- Discard any pending notifications
+
+    disconnect_recording_signals()
+
+    pcall(function()
+        obs.obs_frontend_remove_event_callback(on_event)
+    end)
+
+    cleanup_notifications()
+
+    current_recording_file = nil
+    STATE.recording_game_name = nil
+    STATE.recording_folder_name = nil
+    STATE.recording_session_stamp = nil
+    STATE.recording_split_index = 0
+    STATE.chapter_count = 0
+
+    log("Session: " .. STATE.files_moved .. " moved, " .. STATE.files_skipped .. " skipped")
+end
+
+-- ============================================================================
+-- END OF SCRIPT v2.20.0
+-- Copyright (C) 2025-2026 SlonickLab - Licensed under GPL v3
+-- https://github.com/SlonickLab/Smart-Replay-Mover
+-- ============================================================================

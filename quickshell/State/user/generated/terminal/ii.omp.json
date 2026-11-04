@@ -1,0 +1,83 @@
+{
+  "$schema": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json",
+  "version": 3,
+  "final_space": true,
+  "palette": {
+    "primary": "#b0c6ff",
+    "onPrimary": "#152e60",
+    "secondaryContainer": "#404659",
+    "onSecondaryContainer": "#dce2f9",
+    "error": "#ffb4ab"
+  },
+  "blocks": [
+    {
+      "type": "prompt",
+      "alignment": "left",
+      "segments": [
+        {
+          "type": "executiontime",
+          "style": "diamond",
+          "leading_diamond": "",
+          "trailing_diamond": "",
+          "foreground": "p:onSecondaryContainer",
+          "background": "p:secondaryContainer",
+          "template": " {{ .FormattedMs }}",
+          "options": {
+            "threshold": 0,
+            "style": "austin"
+          }
+        },
+        {
+          "type": "path",
+          "style": "diamond",
+          "leading_diamond": " ",
+          "trailing_diamond": "",
+          "foreground": "p:onPrimary",
+          "background": "p:primary",
+          "template": " → {{ .Path }}",
+          "options": {
+            "style": "agnoster_short",
+            "max_depth": 2,
+            "home_icon": " ",
+            "folder_separator_icon": "\\"
+          }
+        },
+        {
+          "type": "git",
+          "style": "diamond",
+          "leading_diamond": "  ",
+          "trailing_diamond": "",
+          "foreground": "p:onSecondaryContainer",
+          "background": "p:secondaryContainer",
+          "template": " {{ .HEAD }}",
+          "options": {
+            "branch_icon": ""
+          }
+        }
+      ]
+    },
+    {
+      "type": "prompt",
+      "alignment": "left",
+      "newline": true,
+      "segments": [
+        {
+          "type": "text",
+          "style": "plain",
+          "foreground": "p:primary",
+          "foreground_templates": [
+            "{{ if gt .Code 0 }}p:error{{ end }}"
+          ],
+          "template": "  {{ if gt .Code 0 }} {{ else }} {{ end }}"
+        }
+      ]
+    }
+  ],
+  "transient_prompt": {
+    "foreground": "p:primary",
+    "foreground_templates": [
+      "{{ if gt .Code 0 }}p:error{{ end }}"
+    ],
+    "template": "  {{ if gt .Code 0 }} {{ else }} {{ end }} "
+  }
+}

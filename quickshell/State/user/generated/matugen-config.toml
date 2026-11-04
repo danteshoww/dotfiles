@@ -1,0 +1,6 @@
+[config]
+version_check = false
+
+[templates.m3colors]
+input_path = 'C:/Users/Danteshow/AppData/Local/quickshell/ii/defaults/windows/matugen/colors.json'
+output_path = 'C:/Users/Danteshow/AppData/Local/quickshell/State/user/generated/colors.json'
